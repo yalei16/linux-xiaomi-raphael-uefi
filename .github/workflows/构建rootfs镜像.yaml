@@ -85,8 +85,6 @@ jobs:
           echo ">>> 构建 Kali Linux"
           sudo debootstrap --foreign --arch=arm64 kali-rolling rootfs http://mirrors.tuna.tsinghua.edu.cn/kali
           
-          # 修复：ARM64原生运行，不需要qemu，但debootstrap可能需要
-          # 直接运行第二阶段（原生ARM64支持）
           sudo chroot rootfs /debootstrap/debootstrap --second-stage
           
           echo "deb http://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
@@ -108,7 +106,6 @@ jobs:
           SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
           DESKTOP_ENV="${{ github.event.inputs.desktop_env }}"
           
-          # 基础包（最小化）
           sudo chroot rootfs apt-get install -y \
             sudo ssh openssh-server \
             initramfs-tools curl wget \
@@ -117,24 +114,31 @@ jobs:
       
           if [[ "$SYSTEM_TYPE" == "kali-desktop" ]]; then
             if [[ "$DESKTOP_ENV" == "xfce-full" ]]; then
-              # Xfce桌面
               sudo chroot rootfs apt-get install -y \
                 xfce4 xfce4-goodies lightdm slick-greeter \
-                xorg dbus-x11
+                xorg dbus-x11 onboard
               sudo chroot rootfs systemctl enable lightdm
             elif [[ "$DESKTOP_ENV" == "xfce-minimal" ]]; then
-              # 最小Xfce
               sudo chroot rootfs apt-get install -y \
-                xfce4 lightdm
+                xfce4 lightdm onboard
               sudo chroot rootfs systemctl enable lightdm
             fi
-            # 几个常用工具（可选）
             sudo chroot rootfs apt-get install -y nmap netcat-traditional || true
             
           elif [[ "$SYSTEM_TYPE" == "kali-nethunter" ]]; then
-            sudo chroot rootfs apt-get install -y xfce4 lightdm
+            sudo chroot rootfs apt-get install -y xfce4 lightdm onboard
             sudo chroot rootfs systemctl enable lightdm
           fi
+          
+          # 修复：设置图形界面为默认启动（添加）
+          sudo chroot rootfs systemctl set-default graphical.target
+          
+          # 修复：配置自动登录（添加）
+          sudo mkdir -p rootfs/etc/lightdm
+          echo "[Seat:*]" | sudo tee rootfs/etc/lightdm/lightdm.conf
+          echo "autologin-user=kali" | sudo tee -a rootfs/etc/lightdm/lightdm.conf
+          echo "autologin-user-timeout=0" | sudo tee -a rootfs/etc/lightdm/lightdm.conf
+          echo "user-session=xfce" | sudo tee -a rootfs/etc/lightdm/lightdm.conf
           
           # 用户配置
           echo "root:kali" | sudo chroot rootfs chpasswd
@@ -156,7 +160,6 @@ jobs:
           sudo chroot rootfs apt-get update
           sudo chroot rootfs apt-get clean
           
-          # 安装
           sudo chroot rootfs bash -c "
             cd /tmp
             dpkg -i *.deb 2>/dev/null || true
@@ -164,13 +167,11 @@ jobs:
             dpkg --configure -a 2>/dev/null || true
           "
           
-          # 生成initramfs
           KERNEL_DIR=$(ls rootfs/lib/modules/ | head -1)
           if [[ -n "$KERNEL_DIR" ]]; then
             sudo chroot rootfs update-initramfs -c -k "$KERNEL_DIR" 2>/dev/null || true
           fi
           
-          # 创建链接
           sudo chroot rootfs bash -c '
             cd /boot
             KERNEL=$(ls vmlinuz-* 2>/dev/null | head -1)
