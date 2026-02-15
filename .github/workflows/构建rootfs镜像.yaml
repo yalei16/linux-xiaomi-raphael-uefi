@@ -36,7 +36,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm    # ← 只改这里！原来是ubuntu-22.04
+    runs-on: ubuntu-24.04-arm
     
     steps:
       - name: 检出代码
@@ -84,32 +84,30 @@ jobs:
           
           if [[ "$SYSTEM_TYPE" == kali-* ]]; then
             echo ">>> 构建 Kali Linux"
-            sudo debootstrap --foreign --arch=arm64 kali-rolling rootfs http://http.kali.org/kali
+            sudo debootstrap --foreign --arch=arm64 kali-rolling rootfs http://http.kali.org/kali 
             sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
             sudo chroot rootfs /debootstrap/debootstrap --second-stage
             
-            # 修复：用echo而不是heredoc
-            echo "deb http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
-            echo "deb-src http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware" | sudo tee -a rootfs/etc/apt/sources.list
+            echo "deb http://http.kali.org/kali  kali-rolling main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
+            echo "deb-src http://http.kali.org/kali  kali-rolling main contrib non-free non-free-firmware" | sudo tee -a rootfs/etc/apt/sources.list
             
             echo "kali-raphael" | sudo tee rootfs/etc/hostname
             
-            # 修复：hosts文件用多行echo
             echo "127.0.0.1 localhost" | sudo tee rootfs/etc/hosts
             echo "127.0.1.1 kali-raphael" | sudo tee -a rootfs/etc/hosts
             
           elif [[ "$SYSTEM_TYPE" == debian-* ]]; then
             echo ">>> 构建 Debian"
-            sudo debootstrap --arch=arm64 trixie rootfs https://mirrors.tuna.tsinghua.edu.cn/debian/
+            sudo debootstrap --arch=arm64 trixie rootfs https://mirrors.tuna.tsinghua.edu.cn/debian/ 
             echo "xiaomi-raphael" | sudo tee rootfs/etc/hostname
             
-            echo "deb http://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
-            echo "deb http://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware" | sudo tee -a rootfs/etc/apt/sources.list
-            echo "deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware" | sudo tee -a rootfs/etc/apt/sources.list
+            echo "deb http://mirrors.tuna.tsinghua.edu.cn/debian/  trixie main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
+            echo "deb http://mirrors.tuna.tsinghua.edu.cn/debian/  trixie-updates main contrib non-free non-free-firmware" | sudo tee -a rootfs/etc/apt/sources.list
+            echo "deb http://security.debian.org/debian-security  trixie-security main contrib non-free non-free-firmware" | sudo tee -a rootfs/etc/apt/sources.list
             
           else
             echo ">>> 构建 Ubuntu"
-            sudo debootstrap --arch=arm64 noble rootfs http://ports.ubuntu.com/ubuntu-ports/
+            sudo debootstrap --arch=arm64 noble rootfs http://ports.ubuntu.com/ubuntu-ports/ 
             echo "xiaomi-raphael" | sudo tee rootfs/etc/hostname
           fi
       
@@ -172,21 +170,86 @@ jobs:
           sudo cp debs/*.deb rootfs/tmp/ 2>/dev/null || echo "警告: 未找到内核deb包"
           
           if ls rootfs/tmp/*.deb 1>/dev/null 2>&1; then
-            sudo chroot rootfs bash -c "cd /tmp && dpkg -i *.deb 2>/dev/null || apt-get install -f -y"
+            echo ">>> 开始安装内核"
             
+            # 先更新apt
+            sudo chroot rootfs apt-get update
+            
+            # 安装内核包（带错误处理）
+            sudo chroot rootfs bash -c "
+              cd /tmp
+              echo '安装内核包...'
+              
+              # 先安装headers
+              dpkg -i linux-headers-*.deb 2>/dev/null || true
+              
+              # 安装image
+              dpkg -i linux-image-*.deb 2>/dev/null || true
+              
+              # 安装firmware
+              dpkg -i firmware-*.deb 2>/dev/null || true
+              
+              # 安装alsa（如果有）
+              dpkg -i alsa-*.deb 2>/dev/null || true
+              
+              # 修复依赖
+              echo '修复依赖...'
+              apt-get install -f -y --fix-broken
+              
+              # 强制完成配置
+              dpkg --configure -a
+              
+              echo '内核安装完成'
+            "
+            
+            # 生成initramfs
+            echo ">>> 生成initramfs"
             KERNEL_DIR=$(ls rootfs/lib/modules/ | head -1)
             if [[ -n "$KERNEL_DIR" ]]; then
-              sudo chroot rootfs update-initramfs -c -k "$KERNEL_DIR" 2>/dev/null || true
+              echo "找到内核模块目录: $KERNEL_DIR"
+              sudo chroot rootfs update-initramfs -c -k "$KERNEL_DIR" 2>/dev/null || {
+                echo "initramfs生成失败，尝试强制生成..."
+                sudo chroot rootfs mkinitramfs -o /boot/initrd.img-$KERNEL_DIR $KERNEL_DIR 2>/dev/null || true
+              }
+            else
+              echo "警告: 未找到内核模块目录"
             fi
             
-            sudo chroot rootfs bash -c 'cd /boot && ln -sf vmlinuz-* vmlinuz 2>/dev/null; ln -sf initrd.img-* initrd.img 2>/dev/null || true'
+            # 创建启动链接
+            echo ">>> 创建启动链接"
+            sudo chroot rootfs bash -c '
+              cd /boot
+              KERNEL=$(ls vmlinuz-* 2>/dev/null | head -1)
+              INITRD=$(ls initrd.img-* initramfs-* 2>/dev/null | head -1)
+              
+              if [ -n "$KERNEL" ]; then
+                ln -sf "$KERNEL" vmlinuz
+                echo "vmlinuz -> $KERNEL"
+              else
+                echo "警告: 未找到vmlinuz"
+              fi
+              
+              if [ -n "$INITRD" ]; then
+                ln -sf "$INITRD" initrd.img
+                echo "initrd.img -> $INITRD"
+              else
+                echo "警告: 未找到initrd"
+              fi
+              
+              ls -la vmlinuz* initrd* 2>/dev/null || true
+            '
+            
+            echo ">>> 内核安装步骤完成"
+          else
+            echo "错误: 没有内核deb包，无法继续"
+            ls -la rootfs/tmp/ 2>/dev/null || true
+            exit 1
           fi
       
       - name: 配置引导
         run: |
           sudo chroot rootfs apt-get install -y grub-efi-arm64 2>/dev/null || true
           
-          # 修复：fstab用多行echo
           echo "PARTLABEL=linux / ext4 errors=remount-ro,x-systemd.growfs 0 1" | sudo tee rootfs/etc/fstab
           echo "PARTLABEL=esp /boot/efi vfat umask=0077 0 1" | sudo tee -a rootfs/etc/fstab
           
