@@ -1,108 +1,59 @@
-# 内核编译工作流 - 在 Ubuntu 24.04 ARM 上运行
 name: 内核编译
 
-# 手动触发，可指定内核版本
 on:
   workflow_dispatch:
     inputs:
       kernel_version:
-        description: '内核版本号 (如 6.18)'
+        description: '内核版本号（如 6.12）'
         required: true
-        default: '6.18'
+        type: string
 
-# 工作流配置
 jobs:
-  build-kernel:
-    # 在 Ubuntu 24.04 ARM 上运行
-    runs-on: ubuntu-24.04-arm
-    
-    # 设置权限，允许创建 Release
-    permissions:
-      contents: write   # 允许创建 Release 和上传文件
-      packages: write   # 允许上传包（如果需要）
-    
-    # 定义环境变量
-    env:
-      BUILD_TIMESTAMP: ${{ format('{0}', github.run_id) }}-${{ github.run_number }}
+  build:
+    runs-on: ubuntu-22.04
     
     steps:
-      # 检出代码
       - name: 检出代码
         uses: actions/checkout@v4
       
-      # 安装编译依赖
       - name: 安装编译依赖
         run: |
-          sudo apt update
-          sudo apt install -y build-essential gcc-aarch64-linux-gnu bc flex bison \
-          7zip kmod bash cpio binutils tar git wget dpkg libssl-dev clang llvm lld \
-          libelf-dev python3 rsync debhelper-compat libdw-dev
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential crossbuild-essential-arm64 \
+            libncurses-dev bison flex libssl-dev \
+            bc git wget device-tree-compiler
       
-      # 设置 ccache 缓存
-      - name: 设置 ccache
-        uses: actions/cache@v3
-        with:
-          path: ~/.ccache
-          key: ${{ runner.os }}-ccache-kernel-${{ inputs.kernel_version }}
-          restore-keys: |
-            ${{ runner.os }}-ccache-kernel-
-      
-      # 安装并配置 ccache
-      - name: 安装配置 ccache
+      - name: 下载内核源码
         run: |
-          sudo apt install -y ccache
-          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
-          echo "CCACHE_MAXSIZE=5G" >> $GITHUB_ENV
-          echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
+          KERNEL_VER="${{ github.event.inputs.kernel_version }}"
+          wget "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VER}.tar.xz"
+          tar -xf "linux-${KERNEL_VER}.tar.xz"
       
-      # 编译内核
-      - name: 编译内核
-        env:
-          CCACHE_DIR: ${{ env.CCACHE_DIR }}
-          PATH: ${{ env.PATH }}
+      - name: 配置和编译
         run: |
-          # 导出 ccache 环境变量
-          export CCACHE_DIR="$HOME/.ccache"
-          export PATH="/usr/lib/ccache:$PATH"
+          KERNEL_VER="${{ github.event.inputs.kernel_version }}"
+          cd "linux-${KERNEL_VER}"
           
-          # 执行内核编译脚本
-          sudo sh raphael-kernel_build.sh ${{ inputs.kernel_version }}
+          # 使用Raphael配置
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- raphael_defconfig
+          
+          # 启用必要选项
+          ./scripts/config --enable CONFIG_EFI
+          ./scripts/config --enable CONFIG_EFI_STUB
+          
+          # 编译
+          make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          
+          # 打包deb
+          make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- deb-pkg
       
-      # 获取当前时间戳
-      - name: 获取构建时间
-        id: get-timestamp
-        run: |
-          echo "timestamp=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
-      
-      # 列出编译产物
-      - name: 列出编译产物
-        run: ls -la *.deb || true
-      
-      # 创建 GitHub Release 并上传编译产物
-      - name: 创建 Release 并上传产物
+      - name: 发布内核
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: kernel-v${{ inputs.kernel_version }}
-          name: "xiaomi raphael linux内核 v${{ inputs.kernel_version }}"
-          body: |
-            xiaomi raphael linux内核
-            - 版本: ${{ inputs.kernel_version }}
-            - 构建时间: ${{ steps.get-timestamp.outputs.timestamp }}
-            - 构建 ID: ${{ env.BUILD_TIMESTAMP }}
-          draft: false
-          prerelease: false
+          tag_name: "kernel-${{ github.event.inputs.kernel_version }}"
+          name: "Kernel ${{ github.event.inputs.kernel_version }} for Raphael"
           files: |
-            linux-image-xiaomi-raphael.deb
-            linux-headers-xiaomi-raphael.deb
-            firmware-xiaomi-raphael.deb
-            alsa-xiaomi-raphael.deb
+            ../*.deb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      # 上传编译产物作为工作流制品
-      - name: 上传内核包作为工作流制品
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-packages-v${{ inputs.kernel_version }}
-          path: |
-            *.deb
