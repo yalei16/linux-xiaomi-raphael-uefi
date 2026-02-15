@@ -46,9 +46,23 @@ jobs:
         run: |
           mkdir -p debs
           cd debs
-          KERNEL_VER="${{ github.event.inputs.kernel_version }}"
-          echo "寻找内核版本: $KERNEL_VER"
-          ls -la || echo "目录为空"
+          
+          echo "下载内核包..."
+          
+          # 你的固定下载地址
+          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/linux-image-xiaomi-raphael.deb"
+          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/linux-headers-xiaomi-raphael.deb"
+          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/firmware-xiaomi-raphael.deb"
+          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/alsa-xiaomi-raphael.deb"
+          
+          echo "下载完成:"
+          ls -la *.deb
+          
+          # 验证
+          if [[ ! -f "linux-image-xiaomi-raphael.deb" ]]; then
+            echo "错误: 内核包下载失败"
+            exit 1
+          fi
       
       - name: 构建系统镜像
         run: |
