@@ -60,7 +60,6 @@ jobs:
           echo "内核: $KERNEL_VER"
           echo "输出: $ROOTFS_IMG"
           
-          # 精简：10G足够
           truncate -s 10G "$ROOTFS_IMG"
           mkfs.ext4 -F -L "linux" "$ROOTFS_IMG"
           
@@ -71,7 +70,9 @@ jobs:
         run: |
           echo ">>> 构建 Kali Linux"
           sudo debootstrap --foreign --arch=arm64 kali-rolling rootfs http://mirrors.tuna.tsinghua.edu.cn/kali
-          sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
+          
+          # 修复：ARM64原生运行，不需要qemu，但debootstrap可能需要
+          # 直接运行第二阶段（原生ARM64支持）
           sudo chroot rootfs /debootstrap/debootstrap --second-stage
           
           echo "deb http://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
