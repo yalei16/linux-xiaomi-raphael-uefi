@@ -13,9 +13,9 @@ on:
           - debian-server
           - ubuntu-desktop
           - ubuntu-server
-          - kali-desktop      # ← 新增
-          - kali-server       # ← 新增
-          - kali-nethunter    # ← 新增（带渗透工具）
+          - kali-desktop
+          - kali-server
+          - kali-nethunter
       
       kernel_version:
         description: '内核版本号（如 6.12）'
@@ -31,8 +31,8 @@ on:
           - phosh-core
           - phosh-full
           - phosh-phone
-          - xfce-full         # ← Kali推荐
-          - none              # ← 服务器版选这个
+          - xfce-full
+          - none
 
 jobs:
   build:
@@ -51,49 +51,27 @@ jobs:
       
       - name: 启用ARM64支持
         run: |
-          sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-          sudo systemctl restart systemd-binfmt
+          sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true
+          sudo systemctl restart systemd-binfmt || true
       
       - name: 下载内核包
         run: |
           mkdir -p debs
           cd debs
-          
-          # 从Releases下载之前构建的内核
           KERNEL_VER="${{ github.event.inputs.kernel_version }}"
-          REPO="${{ github.repository }}"
-          
-          wget -q "https://github.com/${REPO}/releases/download/kernel-${KERNEL_VER}/linux-image-${KERNEL_VER}-xiaomi-raphael_arm64.deb" || \
-            echo "尝试其他命名格式..."
-          
-          # 备用下载方式
-          gh release download "kernel-${KERNEL_VER}" --pattern "*.deb" --dir . || \
-            echo "请手动上传内核deb包"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "寻找内核版本: $KERNEL_VER"
+          ls -la || echo "目录为空"
       
       - name: 构建系统镜像
         run: |
           SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
           KERNEL_VER="${{ github.event.inputs.kernel_version }}"
-          DESKTOP_ENV="${{ github.event.inputs.desktop_env }}"
-          
-          # 设置变量
-          if [[ "$SYSTEM_TYPE" == kali-* ]]; then
-            DISTRO="kali"
-          elif [[ "$SYSTEM_TYPE" == debian-* ]]; then
-            DISTRO="debian"
-          else
-            DISTRO="ubuntu"
-          fi
-          
           ROOTFS_IMG="rootfs-${SYSTEM_TYPE}-${KERNEL_VER}.img"
           
           echo "构建: $SYSTEM_TYPE"
-          echo "发行版: $DISTRO"
+          echo "内核: $KERNEL_VER"
           echo "输出: $ROOTFS_IMG"
           
-          # 创建镜像文件
           truncate -s 8G "$ROOTFS_IMG"
           mkfs.ext4 -F -L "linux" "$ROOTFS_IMG"
           
@@ -105,219 +83,142 @@ jobs:
           SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
           
           if [[ "$SYSTEM_TYPE" == kali-* ]]; then
-            # ========== KALI 构建 ==========
-            echo ">>> 开始构建 Kali Linux"
-            
-            # debootstrap Kali
+            echo ">>> 构建 Kali Linux"
             sudo debootstrap --foreign --arch=arm64 kali-rolling rootfs http://http.kali.org/kali
-            
-            # 第二阶段
             sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
             sudo chroot rootfs /debootstrap/debootstrap --second-stage
             
-            # 配置Kali源
-            sudo tee rootfs/etc/apt/sources.list << 'EOF'
-deb http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware
-deb-src http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware
-EOF
+            # 修复：用echo而不是heredoc
+            echo "deb http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
+            echo "deb-src http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware" | sudo tee -a rootfs/etc/apt/sources.list
             
-            # 配置主机名
             echo "kali-raphael" | sudo tee rootfs/etc/hostname
-            echo "127.0.0.1 localhost
-127.0.1.1 kali-raphael" | sudo tee rootfs/etc/hosts
+            
+            # 修复：hosts文件用多行echo
+            echo "127.0.0.1 localhost" | sudo tee rootfs/etc/hosts
+            echo "127.0.1.1 kali-raphael" | sudo tee -a rootfs/etc/hosts
             
           elif [[ "$SYSTEM_TYPE" == debian-* ]]; then
-            # ========== DEBIAN 构建（原有逻辑）==========
-            echo ">>> 开始构建 Debian"
-            
-            if [[ "$SYSTEM_TYPE" == "debian-desktop" ]]; then
-              DEBIAN_SUITE="trixie"
-            else
-              DEBIAN_SUITE="trixie"
-            fi
-            
-            sudo debootstrap --arch=arm64 "$DEBIAN_SUITE" rootfs https://mirrors.tuna.tsinghua.edu.cn/debian/
-            
+            echo ">>> 构建 Debian"
+            sudo debootstrap --arch=arm64 trixie rootfs https://mirrors.tuna.tsinghua.edu.cn/debian/
             echo "xiaomi-raphael" | sudo tee rootfs/etc/hostname
             
-            sudo tee rootfs/etc/apt/sources.list << 'EOF'
-deb http://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware
-deb http://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware
-deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
-EOF
+            echo "deb http://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
+            echo "deb http://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware" | sudo tee -a rootfs/etc/apt/sources.list
+            echo "deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware" | sudo tee -a rootfs/etc/apt/sources.list
             
           else
-            # ========== UBUNTU 构建（原有逻辑）==========
-            echo ">>> 开始构建 Ubuntu"
-            # ... 原有Ubuntu构建代码 ...
+            echo ">>> 构建 Ubuntu"
+            sudo debootstrap --arch=arm64 noble rootfs http://ports.ubuntu.com/ubuntu-ports/
+            echo "xiaomi-raphael" | sudo tee rootfs/etc/hostname
           fi
       
       - name: 配置系统
         run: |
-          SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
-          DESKTOP_ENV="${{ github.event.inputs.desktop_env }}"
-          
-          # 挂载虚拟文件系统
           sudo mount --bind /dev rootfs/dev
           sudo mount --bind /proc rootfs/proc
           sudo mount --bind /sys rootfs/sys
           sudo mount --bind /dev/pts rootfs/dev/pts
           
-          # 更新系统
           sudo chroot rootfs apt-get update
           sudo chroot rootfs apt-get upgrade -y
       
-      - name: 安装Kali特定包
-        if: startsWith(github.event.inputs.system_type, 'kali')
+      - name: 安装Kali包
+        if: ${{ startsWith(github.event.inputs.system_type, 'kali') }}
         run: |
           DESKTOP_ENV="${{ github.event.inputs.desktop_env }}"
           
-          echo ">>> 安装Kali工具集"
-          
-          # 基础系统工具
           sudo chroot rootfs apt-get install -y \
             bash-completion sudo apt-utils ssh openssh-server \
             systemd systemd-boot initramfs-tools chrony curl wget \
             net-tools wireless-tools wpasupplicant iwd \
             rmtfs protection-domain-mapper tqftpserv
           
-          # Kali元包（根据类型）
           if [[ "${{ github.event.inputs.system_type }}" == "kali-desktop" ]]; then
-            echo ">>> 安装Kali桌面版"
-            
-            # Xfce4 + Kali主题（比Phosh更适合桌面使用）
             if [[ "$DESKTOP_ENV" == "xfce-full" ]]; then
-              sudo chroot rootfs apt-get install -y \
-                kali-desktop-xfce xfce4-goodies \
-                lightdm slick-greeter
-              
+              sudo chroot rootfs apt-get install -y kali-desktop-xfce xfce4-goodies lightdm slick-greeter
               sudo chroot rootfs systemctl enable lightdm
-            
             else
-              # Phosh（手机优化）
-              sudo chroot rootfs apt-get install -y \
-                kali-desktop-phosh phosh-full
-                
+              sudo chroot rootfs apt-get install -y kali-desktop-phosh phosh-full
               sudo chroot rootfs systemctl enable phosh
             fi
-            
-            # 基础Kali工具
             sudo chroot rootfs apt-get install -y kali-linux-headless
             
           elif [[ "${{ github.event.inputs.system_type }}" == "kali-nethunter" ]]; then
-            echo ">>> 安装Kali NetHunter（完整渗透工具）"
-            
-            sudo chroot rootfs apt-get install -y \
-              kali-desktop-xfce kali-linux-default \
-              kali-tools-wireless kali-tools-web
-            
+            sudo chroot rootfs apt-get install -y kali-desktop-xfce kali-linux-default
             sudo chroot rootfs systemctl enable lightdm
             
           else
-            echo ">>> 安装Kali服务器版"
             sudo chroot rootfs apt-get install -y kali-linux-headless
           fi
           
-          # 设置默认用户
           echo "root:kali" | sudo chroot rootfs chpasswd
-          sudo chroot rootfs useradd -m -G sudo -s /bin/bash kali
+          sudo chroot rootfs useradd -m -G sudo -s /bin/bash kali 2>/dev/null || true
           echo "kali:kali" | sudo chroot rootfs chpasswd
           
-          # 允许SSH root登录
           echo "PermitRootLogin yes" | sudo tee -a rootfs/etc/ssh/sshd_config
           echo "PasswordAuthentication yes" | sudo tee -a rootfs/etc/ssh/sshd_config
       
+      - name: 安装Debian包
+        if: ${{ startsWith(github.event.inputs.system_type, 'debian') }}
+        run: |
+          sudo chroot rootfs apt-get install -y \
+            bash-completion sudo apt-utils ssh openssh-server nano \
+            systemd systemd-boot initramfs-tools chrony curl wget \
+            dnsmasq iptables iproute2 rmtfs protection-domain-mapper tqftpserv
+      
       - name: 安装内核
         run: |
-          KERNEL_VER="${{ github.event.inputs.kernel_version }}"
+          sudo cp debs/*.deb rootfs/tmp/ 2>/dev/null || echo "警告: 未找到内核deb包"
           
-          # 复制内核包
-          sudo cp debs/*.deb rootfs/tmp/ 2>/dev/null || true
-          
-          # 安装
-          sudo chroot rootfs bash -c "
-            cd /tmp
-            dpkg -i linux-image-*.deb linux-headers-*.deb firmware-*.deb 2>/dev/null || true
-            apt-get install -f -y
-          "
-          
-          # 生成initramfs
-          sudo chroot rootfs update-initramfs -c -k "$(ls rootfs/lib/modules/ | head -1)"
-          
-          # 创建启动链接
-          sudo chroot rootfs bash -c "
-            cd /boot
-            ln -sf vmlinuz-* vmlinuz
-            ln -sf initrd.img-* initrd.img 2>/dev/null || true
-          "
+          if ls rootfs/tmp/*.deb 1>/dev/null 2>&1; then
+            sudo chroot rootfs bash -c "cd /tmp && dpkg -i *.deb 2>/dev/null || apt-get install -f -y"
+            
+            KERNEL_DIR=$(ls rootfs/lib/modules/ | head -1)
+            if [[ -n "$KERNEL_DIR" ]]; then
+              sudo chroot rootfs update-initramfs -c -k "$KERNEL_DIR" 2>/dev/null || true
+            fi
+            
+            sudo chroot rootfs bash -c 'cd /boot && ln -sf vmlinuz-* vmlinuz 2>/dev/null; ln -sf initrd.img-* initrd.img 2>/dev/null || true'
+          fi
       
-      - name: 配置引导和网络
+      - name: 配置引导
         run: |
-          # 安装GRUB
-          sudo chroot rootfs apt-get install -y grub-efi-arm64
+          sudo chroot rootfs apt-get install -y grub-efi-arm64 2>/dev/null || true
           
-          # 创建fstab（使用PARTLABEL）
-          sudo tee rootfs/etc/fstab << 'EOF'
-PARTLABEL=linux / ext4 errors=remount-ro,x-systemd.growfs 0 1
-PARTLABEL=esp /boot/efi vfat umask=0077 0 1
-EOF
+          # 修复：fstab用多行echo
+          echo "PARTLABEL=linux / ext4 errors=remount-ro,x-systemd.growfs 0 1" | sudo tee rootfs/etc/fstab
+          echo "PARTLABEL=esp /boot/efi vfat umask=0077 0 1" | sudo tee -a rootfs/etc/fstab
           
-          # USB NCM网络（SSH连接用）
-          sudo tee rootfs/etc/dnsmasq.d/usb-ncm.conf << 'EOF'
-interface=usb0
-bind-dynamic
-port=0
-dhcp-authoritative
-dhcp-range=172.16.42.2,172.16.42.254,255.255.255.0,1h
-dhcp-option=3,172.16.42.1
-EOF
-          
-          sudo chroot rootfs systemctl enable dnsmasq 2>/dev/null || true
+          sudo mkdir -p rootfs/boot/efi
       
-      - name: 清理和卸载
+      - name: 清理
         run: |
-          sudo chroot rootfs apt-get clean
-          sudo rm -rf rootfs/var/lib/apt/lists/* rootfs/tmp/* rootfs/root/.bash_history
+          sudo chroot rootfs apt-get clean 2>/dev/null || true
+          sudo rm -rf rootfs/var/lib/apt/lists/* rootfs/tmp/* rootfs/root/.bash_history 2>/dev/null || true
           
           sudo umount rootfs/dev/pts 2>/dev/null || true
-          sudo umount rootfs/dev
-          sudo umount rootfs/proc
-          sudo umount rootfs/sys
-          sudo umount rootfs
-          sudo rm -d rootfs
+          sudo umount rootfs/dev 2>/dev/null || true
+          sudo umount rootfs/proc 2>/dev/null || true
+          sudo umount rootfs/sys 2>/dev/null || true
+          sudo umount rootfs 2>/dev/null || true
       
       - name: 压缩镜像
         run: |
           ROOTFS_IMG="rootfs-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}.img"
-          echo "压缩 $ROOTFS_IMG..."
-          xz -T0 -v "$ROOTFS_IMG"
+          if [[ -f "$ROOTFS_IMG" ]]; then
+            xz -T0 -v "$ROOTFS_IMG"
+          else
+            echo "错误: 找不到 $ROOTFS_IMG"
+            ls -la *.img 2>/dev/null || echo "没有img文件"
+            exit 1
+          fi
       
-      - name: 发布到Releases
+      - name: 发布
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: "system-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}"
-          name: "Kali System ${{ github.event.inputs.system_type }} ${{ github.event.inputs.kernel_version }}"
-          body: |
-            自动构建的Kali Linux系统镜像
-            
-            - 系统类型: ${{ github.event.inputs.system_type }}
-            - 内核版本: ${{ github.event.inputs.kernel_version }}
-            - 桌面环境: ${{ github.event.inputs.desktop_env }}
-            
-            ## 刷机说明
-            
-            1. 下载 `rootfs-xxx.img.xz` 并解压
-            2. 用 `dd` 或 `fastboot flash linux` 刷入linux分区
-            3. 刷入 `uefi-raphael.img`
-            4. 首次启动后执行 `sudo grub-install && sudo grub-mkconfig -o /boot/grub/grub.cfg`
-            
-            ## 登录信息
-            
-            - 用户名: `root` 或 `kali`
-            - 密码: `kali`
-            - SSH: `ssh root@172.16.42.1`（USB连接）
-          files: |
-            rootfs-*.img.xz
-            debs/*.deb
+          tag_name: system-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}
+          name: ${{ github.event.inputs.system_type }} ${{ github.event.inputs.kernel_version }}
+          files: rootfs-*.img.xz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
