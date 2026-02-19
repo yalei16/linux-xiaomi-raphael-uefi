@@ -1,215 +1,236 @@
-name: 构建系统镜像
+name: 构建 Kali Boot 镜像
 
 on:
   workflow_dispatch:
     inputs:
-      system_type:
-        description: '系统类型'
-        required: true
-        default: 'kali-desktop'
-        type: choice
-        options:
-          - kali-desktop
-          - kali-server
-          - kali-nethunter
-      
       kernel_version:
-        description: '内核版本号（如 6.12）'
+        description: '内核版本号（如 6.18）'
         required: true
         type: string
-      
-      desktop_env:
-        description: '桌面环境（仅桌面版有效）'
-        required: false
-        default: 'xfce-full'
-        type: choice
-        options:
-          - xfce-full
-          - xfce-minimal
-          - none
+      rootfs_tag:
+        description: 'rootfs 镜像的 release tag（如 kali-kali-desktop-6.18）'
+        required: true
+        type: string
 
 jobs:
-  build:
+  build-boot:
     runs-on: ubuntu-24.04-arm
     
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
       
-      - name: 安装依赖
+      - name: 下载依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            debootstrap parted e2fsprogs xz-utils
+            mtools dosfstools e2fsprogs xz-utils wget cpio
       
-      - name: 下载内核包
+      - name: 下载内核包和 rootfs
         run: |
-          mkdir -p debs
-          cd debs
+          mkdir -p build
+          cd build
           
-          echo "下载内核包..."
-          
-          # 你的固定下载地址
+          # 下载内核包
+          echo ">>> 下载内核包..."
           wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/linux-image-xiaomi-raphael.deb"
           wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/linux-headers-xiaomi-raphael.deb"
           wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/firmware-xiaomi-raphael.deb"
           wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/alsa-xiaomi-raphael.deb"
           
-          echo "下载完成:"
+          # 下载对应的 rootfs（用于提取版本信息）
+          echo ">>> 下载 rootfs 信息..."
+          wget -q "https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.rootfs_tag }}/rootfs-kali-desktop-${{ github.event.inputs.kernel_version }}.img.xz" -O rootfs.img.xz || true
+          
           ls -la *.deb
+      
+      - name: 提取内核文件
+        run: |
+          cd build
+          mkdir -p kernel-extract
+          cd kernel-extract
           
-          # 验证
-          if [[ ! -f "linux-image-xiaomi-raphael.deb" ]]; then
-            echo "错误: 内核包下载失败"
+          # 解压 deb 包
+          ar x ../linux-image-xiaomi-raphael.deb
+          tar -xf data.tar.xz
+          
+          # 查找内核文件
+          echo ">>> 查找内核文件..."
+          find . -name "vmlinuz-*" -o -name "Image-*" | head -5
+          find . -name "*.dtb" | head -5
+          
+          # 复制内核文件到 build 目录
+          KERNEL_FILE=$(find . -name "vmlinuz-*" | head -1)
+          DTB_FILE=$(find . -path "*/qcom/sm8150-xiaomi-raphael.dtb" | head -1)
+          
+          if [ -z "$KERNEL_FILE" ]; then
+            echo "错误: 找不到内核文件"
             exit 1
           fi
+          
+          cp "$KERNEL_FILE" ../vmlinuz
+          cp "$DTB_FILE" ../dtb || echo "警告: 未找到 dtb 文件"
+          
+          # 获取内核版本
+          KERNEL_VERSION=$(basename "$KERNEL_FILE" | sed 's/vmlinuz-//')
+          echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
+          echo "找到内核版本: $KERNEL_VERSION"
+          
+          cd ..
+          ls -la vmlinuz dtb
       
-      - name: 构建系统镜像
+      - name: 创建 initramfs
         run: |
-          SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
-          KERNEL_VER="${{ github.event.inputs.kernel_version }}"
-          ROOTFS_IMG="rootfs-${SYSTEM_TYPE}-${KERNEL_VER}.img"
+          cd build
           
-          echo "构建: $SYSTEM_TYPE"
-          echo "内核: $KERNEL_VER"
-          echo "输出: $ROOTFS_IMG"
+          # 创建临时目录构建 initramfs
+          mkdir -p initramfs/{bin,sbin,lib,lib64,usr,dev,proc,sys,tmp,run}
           
-          truncate -s 10G "$ROOTFS_IMG"
-          mkfs.ext4 -F -L "linux" "$ROOTFS_IMG"
+          # 复制必要的工具
+          sudo apt-get install -y busybox-static
           
-          mkdir -p rootfs
-          sudo mount -o loop "$ROOTFS_IMG" rootfs
-      
-      - name: 安装Kali基础系统
-        run: |
-          echo ">>> 构建 Kali Linux"
-          sudo debootstrap --foreign --arch=arm64 kali-rolling rootfs http://mirrors.tuna.tsinghua.edu.cn/kali 
+          # 创建基本 init 脚本
+          cat > initramfs/init << 'INITEOF'
+          #!/bin/sh
           
-          sudo chroot rootfs /debootstrap/debootstrap --second-stage
+          # 挂载基本文件系统
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          mount -t devtmpfs none /dev
           
-          echo "deb http://mirrors.tuna.tsinghua.edu.cn/kali  kali-rolling main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
-          echo "kali-raphael" | sudo tee rootfs/etc/hostname
-          echo "127.0.0.1 localhost" | sudo tee rootfs/etc/hosts
-          echo "127.0.1.1 kali-raphael" | sudo tee -a rootfs/etc/hosts
-      
-      - name: 配置系统
-        run: |
-          sudo mount --bind /dev rootfs/dev
-          sudo mount --bind /proc rootfs/proc
-          sudo mount --bind /sys rootfs/sys
+          # 等待设备就绪
+          sleep 2
           
-          sudo chroot rootfs apt-get update
-          sudo chroot rootfs apt-get upgrade -y
-      
-      - name: 安装软件包
-        run: |
-          SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
-          DESKTOP_ENV="${{ github.event.inputs.desktop_env }}"
+          # 查找根分区
+          ROOT_PART="/dev/sda33"
           
-          sudo chroot rootfs apt-get install -y \
-            sudo ssh openssh-server \
-            initramfs-tools curl wget \
-            net-tools wireless-tools wpasupplicant \
-            vim nano
-      
-          if [[ "$SYSTEM_TYPE" == "kali-desktop" ]]; then
-            if [[ "$DESKTOP_ENV" == "xfce-full" ]]; then
-              sudo chroot rootfs apt-get install -y \
-                xfce4 xfce4-goodies lightdm slick-greeter \
-                xorg dbus-x11
-              sudo chroot rootfs systemctl enable lightdm
-            elif [[ "$DESKTOP_ENV" == "xfce-minimal" ]]; then
-              sudo chroot rootfs apt-get install -y \
-                xfce4 lightdm
-              sudo chroot rootfs systemctl enable lightdm
-            fi
-            sudo chroot rootfs apt-get install -y nmap netcat-traditional || true
-            
-          elif [[ "$SYSTEM_TYPE" == "kali-nethunter" ]]; then
-            sudo chroot rootfs apt-get install -y xfce4 lightdm
-            sudo chroot rootfs systemctl enable lightdm
+          # 如果 PARTLABEL 存在，使用它
+          if [ -e /dev/disk/by-partlabel/linux ]; then
+            ROOT_PART="/dev/disk/by-partlabel/linux"
           fi
           
-          # 设置图形界面为默认启动
-          sudo chroot rootfs systemctl set-default graphical.target
-          
-          # 配置 LightDM 自动登录（修复：使用正确的配置路径）
-          sudo mkdir -p rootfs/etc/lightdm/lightdm.conf.d
-          cat << 'EOF' | sudo tee rootfs/etc/lightdm/lightdm.conf.d/50-autologin.conf
-          [Seat:*]
-          autologin-user=kali
-          autologin-user-timeout=0
-          user-session=xfce
-          EOF
-          
-          # 用户配置
-          echo "root:kali" | sudo chroot rootfs chpasswd
-          sudo chroot rootfs useradd -m -G sudo -s /bin/bash kali 2>/dev/null || true
-          echo "kali:kali" | sudo chroot rootfs chpasswd
-          
-          # SSH配置
-          echo "PermitRootLogin yes" | sudo tee -a rootfs/etc/ssh/sshd_config
-          echo "PasswordAuthentication yes" | sudo tee -a rootfs/etc/ssh/sshd_config
-      
-      - name: 安装内核
-        run: |
-          sudo cp debs/*.deb rootfs/tmp/ 2>/dev/null || {
-            echo "错误: 未找到内核deb包"
-            exit 1
+          # 挂载根文件系统
+          mkdir -p /mnt/root
+          mount -t ext4 "$ROOT_PART" /mnt/root || {
+            echo "等待根分区就绪..."
+            sleep 5
+            mount -t ext4 "$ROOT_PART" /mnt/root
           }
           
-          echo ">>> 安装内核"
-          sudo chroot rootfs apt-get update
-          sudo chroot rootfs apt-get clean
+          # 切换到真正的根文件系统
+          cd /mnt/root
+          mkdir -p oldroot
           
-          sudo chroot rootfs bash -c "
-            cd /tmp
-            dpkg -i *.deb 2>/dev/null || true
-            apt-get install -f -y
-            dpkg --configure -a 2>/dev/null || true
-          "
+          # 挂载虚拟文件系统到新的根
+          mount --move /proc /mnt/root/proc
+          mount --move /sys /mnt/root/sys
+          mount --move /dev /mnt/root/dev
           
-          KERNEL_DIR=$(ls rootfs/lib/modules/ | head -1)
-          if [[ -n "$KERNEL_DIR" ]]; then
-            sudo chroot rootfs update-initramfs -c -k "$KERNEL_DIR" 2>/dev/null || true
+          # 切换根并执行 init
+          exec switch_root /mnt/root /sbin/init
+          INITEOF
+          
+          chmod +x initramfs/init
+          
+          # 复制 busybox
+          cp /bin/busybox initramfs/bin/
+          cd initramfs/bin
+          for cmd in sh echo mount umount sleep mkdir cat; do
+            ln -s busybox $cmd
+          done
+          cd ../..
+          
+          # 打包 initramfs
+          cd initramfs
+          find . | cpio -o -H newc | gzip > ../initrd.img
+          cd ..
+          
+          ls -la initrd.img
+      
+      - name: 创建 GRUB 配置
+        run: |
+          cd build
+          KERNEL_VERSION="${{ env.KERNEL_VERSION }}"
+          
+          mkdir -p boot/grub
+          
+          cat > boot/grub/grub.cfg << EOF
+          set timeout=10
+          set default=0
+          
+          # 加载必要模块
+          insmod gzio
+          insmod part_gpt
+          insmod ext2
+          
+          menuentry 'Kali Linux' --class kali --class gnu-linux --class gnu --class os {
+              search --no-floppy --part-label linux --set=root
+              
+              linux /vmlinuz root=/dev/sda33 ro console=tty0 console=ttyMSM0,115200n8
+              initrd /initrd.img
+              devicetree /dtb
+          }
+          
+          menuentry 'Kali Linux (Recovery)' --class kali --class gnu-linux --class gnu --class os {
+              search --no-floppy --part-label linux --set=root
+              
+              linux /vmlinuz root=/dev/sda33 ro single debug console=tty0 console=ttyMSM0,115200n8
+              initrd /initrd.img
+              devicetree /dtb
+          }
+          EOF
+          
+          # 复制内核文件到 boot 目录
+          cp vmlinuz boot/
+          cp initrd.img boot/
+          cp dtb boot/ 2>/dev/null || echo "警告: dtb 未复制"
+          
+          ls -la boot/
+          cat boot/grub/grub.cfg
+      
+      - name: 创建 boot.img（FAT32 格式）
+        run: |
+          cd build
+          
+          # 创建 128MB 的 boot.img
+          BOOT_SIZE=128M
+          truncate -s $BOOT_SIZE boot.img
+          
+          # 格式化为 FAT32
+          mkfs.vfat -F32 -n "KALI-BOOT" boot.img
+          
+          # 使用 mtools 复制文件（不需要挂载）
+          mcopy -i boot.img boot/vmlinuz ::vmlinuz
+          mcopy -i boot.img boot/initrd.img ::initrd.img
+          [ -f boot/dtb ] && mcopy -i boot.img boot/dtb ::dtb
+          
+          # 创建 EFI/boot 目录结构
+          mmd -i boot.img ::EFI
+          mmd -i boot.img ::EFI/boot
+          mcopy -i boot.img boot/grub/grub.cfg ::EFI/boot/grub.cfg
+          
+          # 复制 GRUB EFI 文件（从系统中获取）
+          if [ -f /usr/lib/grub/arm64-efi/monolithic/grubaa64.efi ]; then
+            mcopy -i boot.img /usr/lib/grub/arm64-efi/monolithic/grubaa64.efi ::EFI/boot/BOOTAA64.EFI
+          elif [ -f /usr/lib/grub/arm64-efi/grub.efi ]; then
+            mcopy -i boot.img /usr/lib/grub/arm64-efi/grub.efi ::EFI/boot/BOOTAA64.EFI
+          else
+            echo "警告: 未找到 GRUB EFI 文件，需要手动添加"
           fi
           
-          sudo chroot rootfs bash -c '
-            cd /boot
-            KERNEL=$(ls vmlinuz-* 2>/dev/null | head -1)
-            INITRD=$(ls initrd.img-* 2>/dev/null | head -1)
-            [ -n "$KERNEL" ] && ln -sf "$KERNEL" vmlinuz
-            [ -n "$INITRD" ] && ln -sf "$INITRD" initrd.img
-            ls -la
-          '
+          # 验证内容
+          echo ">>> boot.img 内容:"
+          mdir -i boot.img ::
+          mdir -i boot.img ::EFI/boot
+          
+          # 压缩
+          xz -T0 -v boot.img
       
-      - name: 配置引导
-        run: |
-          sudo chroot rootfs apt-get install -y grub-efi-arm64 2>/dev/null || true
-          
-          echo "PARTLABEL=linux / ext4 errors=remount-ro 0 1" | sudo tee rootfs/etc/fstab
-          echo "PARTLABEL=esp /boot/efi vfat umask=0077 0 1" | sudo tee -a rootfs/etc/fstab
-          
-          sudo mkdir -p rootfs/boot/efi
-      
-      - name: 清理和压缩
-        run: |
-          sudo chroot rootfs apt-get clean 2>/dev/null || true
-          sudo rm -rf rootfs/var/lib/apt/lists/* rootfs/tmp/* 2>/dev/null || true
-          
-          sudo umount rootfs/dev 2>/dev/null || true
-          sudo umount rootfs/proc 2>/dev/null || true
-          sudo umount rootfs/sys 2>/dev/null || true
-          sudo umount rootfs 2>/dev/null || true
-          
-          ROOTFS_IMG="rootfs-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}.img"
-          xz -T0 -v "$ROOTFS_IMG"
-      
-      - name: 发布
+      - name: 发布 Boot 镜像
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: kali-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}
-          name: "Kali ${{ github.event.inputs.system_type }} ${{ github.event.inputs.kernel_version }}"
-          files: rootfs-*.img.xz
+          tag_name: boot-${{ github.event.inputs.kernel_version }}
+          name: "Kali Boot Image ${{ github.event.inputs.kernel_version }}"
+          files: build/boot.img.xz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
