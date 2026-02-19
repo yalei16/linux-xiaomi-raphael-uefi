@@ -1,4 +1,4 @@
-name: 构建系统镜像
+name: 构建 Kali Rootfs 镜像
 
 on:
   workflow_dispatch:
@@ -14,8 +14,9 @@ on:
           - kali-nethunter
       
       kernel_version:
-        description: '内核版本号（如 6.12）'
+        description: '内核版本号（如 6.12.8）'
         required: true
+        default: '6.18'
         type: string
       
       desktop_env:
@@ -28,6 +29,10 @@ on:
           - xfce-minimal
           - none
 
+env:
+  KERNEL_REPO: "yalei16/linux-xiaomi-raphael-uefi"
+  TZ: Asia/Shanghai
+
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
@@ -36,35 +41,36 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
       
-      - name: 安装依赖
+      - name: 安装构建依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            debootstrap parted e2fsprogs xz-utils
+            debootstrap qemu-user-static binfmt-support \
+            parted e2fsprogs xz-utils kpartx
       
       - name: 下载内核包
         run: |
           mkdir -p debs
           cd debs
           
-          echo "下载内核包..."
+          KERNEL_VER="${{ github.event.inputs.kernel_version }}"
+          BASE_URL="https://github.com/${{ env.KERNEL_REPO }}/releases/download/kernel-v${KERNEL_VER}"
           
-          # 你的固定下载地址
-          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/linux-image-xiaomi-raphael.deb"
-          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/linux-headers-xiaomi-raphael.deb"
-          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/firmware-xiaomi-raphael.deb"
-          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/alsa-xiaomi-raphael.deb"
+          echo "下载内核 v${KERNEL_VER}..."
+          
+          # 下载所有内核包（修复URL空格问题）
+          for pkg in linux-image-xiaomi-raphael linux-headers-xiaomi-raphael firmware-xiaomi-raphael alsa-xiaomi-raphael; do
+            echo "下载 ${pkg}.deb ..."
+            wget -q --show-progress "${BASE_URL}/${pkg}.deb" -O "${pkg}.deb" || {
+              echo "错误: 下载 ${pkg}.deb 失败"
+              exit 1
+            }
+          done
           
           echo "下载完成:"
           ls -la *.deb
-          
-          # 验证
-          if [[ ! -f "linux-image-xiaomi-raphael.deb" ]]; then
-            echo "错误: 内核包下载失败"
-            exit 1
-          fi
       
-      - name: 构建系统镜像
+      - name: 创建并挂载根文件系统
         run: |
           SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
           KERNEL_VER="${{ github.event.inputs.kernel_version }}"
@@ -74,140 +80,245 @@ jobs:
           echo "内核: $KERNEL_VER"
           echo "输出: $ROOTFS_IMG"
           
-          truncate -s 10G "$ROOTFS_IMG"
-          mkfs.ext4 -F -L "linux" "$ROOTFS_IMG"
+          # 创建 8GB 镜像（足够使用，10G 偏大）
+          truncate -s 8G "$ROOTFS_IMG"
+          mkfs.ext4 -F -L "linux-root" "$ROOTFS_IMG"
           
           mkdir -p rootfs
           sudo mount -o loop "$ROOTFS_IMG" rootfs
-      
-      - name: 安装Kali基础系统
-        run: |
-          echo ">>> 构建 Kali Linux"
-          sudo debootstrap --foreign --arch=arm64 kali-rolling rootfs http://mirrors.tuna.tsinghua.edu.cn/kali
           
-          sudo chroot rootfs /debootstrap/debootstrap --second-stage
-          
-          echo "deb http://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
-          echo "kali-raphael" | sudo tee rootfs/etc/hostname
-          echo "127.0.0.1 localhost" | sudo tee rootfs/etc/hosts
-          echo "127.0.1.1 kali-raphael" | sudo tee -a rootfs/etc/hosts
+          # 创建标记文件用于后续步骤
+          echo "$ROOTFS_IMG" > .img_name
       
-      - name: 配置系统
+      - name: 安装 Kali 基础系统
         run: |
+          echo ">>> 开始 debootstrap 第一阶段"
+          sudo debootstrap --foreign --arch=arm64 \
+            kali-rolling rootfs \
+            http://mirrors.tuna.tsinghua.edu.cn/kali
+          
+          echo ">>> 挂载虚拟文件系统"
           sudo mount --bind /dev rootfs/dev
           sudo mount --bind /proc rootfs/proc
           sudo mount --bind /sys rootfs/sys
+          sudo mount --bind /dev/pts rootfs/dev/pts
           
-          sudo chroot rootfs apt-get update
-          sudo chroot rootfs apt-get upgrade -y
+          echo ">>> 执行 debootstrap 第二阶段"
+          sudo chroot rootfs /debootstrap/debootstrap --second-stage
       
-      - name: 安装软件包
+      - name: 配置系统基础环境
+        run: |
+          # 配置软件源
+          cat << 'EOF' | sudo tee rootfs/etc/apt/sources.list
+          deb http://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free non-free-firmware
+          deb-src http://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free non-free-firmware
+          EOF
+          
+          # 配置主机名和 hosts
+          echo "kali-raphael" | sudo tee rootfs/etc/hostname
+          cat << 'EOF' | sudo tee rootfs/etc/hosts
+          127.0.0.1       localhost
+          127.0.1.1       kali-raphael
+          ::1             localhost ip6-localhost ip6-loopback
+          EOF
+          
+          # 配置时区
+          sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai rootfs/etc/localtime
+          echo "Asia/Shanghai" | sudo tee rootfs/etc/timezone
+          
+          # 配置本地化
+          sudo chroot rootfs apt-get update
+          sudo chroot rootfs apt-get install -y locales
+          sudo sed -i 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' rootfs/etc/locale.gen
+          sudo sed -i 's/# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' rootfs/etc/locale.gen
+          sudo chroot rootfs locale-gen
+          echo "LANG=en_US.UTF-8" | sudo tee rootfs/etc/default/locale
+      
+      - name: 安装系统软件包
         run: |
           SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
           DESKTOP_ENV="${{ github.event.inputs.desktop_env }}"
           
+          echo ">>> 安装基础工具"
           sudo chroot rootfs apt-get install -y \
-            sudo ssh openssh-server \
-            initramfs-tools curl wget \
-            net-tools wireless-tools wpasupplicant \
-            vim nano
-      
-          if [[ "$SYSTEM_TYPE" == "kali-desktop" ]]; then
+            sudo openssh-server initramfs-tools \
+            curl wget net-tools wireless-tools wpasupplicant \
+            vim nano htop pciutils usbutils \
+            firmware-linux firmware-linux-nonfree \
+            linux-firmware
+          
+          # 桌面环境安装
+          if [[ "$SYSTEM_TYPE" == "kali-desktop" || "$SYSTEM_TYPE" == "kali-nethunter" ]]; then
+            echo ">>> 安装桌面环境: $DESKTOP_ENV"
+            
             if [[ "$DESKTOP_ENV" == "xfce-full" ]]; then
               sudo chroot rootfs apt-get install -y \
                 xfce4 xfce4-goodies lightdm slick-greeter \
-                xorg dbus-x11 onboard
-              sudo chroot rootfs systemctl enable lightdm
+                xorg dbus-x11 onboard \
+                network-manager network-manager-gnome \
+                pulseaudio pavucontrol
             elif [[ "$DESKTOP_ENV" == "xfce-minimal" ]]; then
               sudo chroot rootfs apt-get install -y \
-                xfce4 lightdm onboard
-              sudo chroot rootfs systemctl enable lightdm
+                xfce4 lightdm onboard xorg dbus-x11
             fi
-            sudo chroot rootfs apt-get install -y nmap netcat-traditional || true
             
-          elif [[ "$SYSTEM_TYPE" == "kali-nethunter" ]]; then
-            sudo chroot rootfs apt-get install -y xfce4 lightdm onboard
+            # 安装 Kali 桌面版工具
+            if [[ "$SYSTEM_TYPE" == "kali-desktop" ]]; then
+              sudo chroot rootfs apt-get install -y \
+                kali-desktop-xfce kali-tools-top10 || true
+            fi
+            
+            # 配置 LightDM 自动登录（修复路径问题）
+            sudo mkdir -p rootfs/etc/lightdm/lightdm.conf.d
+            cat << 'EOF' | sudo tee rootfs/etc/lightdm/lightdm.conf.d/50-autologin.conf
+            [Seat:*]
+            autologin-user=kali
+            autologin-user-timeout=0
+            user-session=xfce
+            greeter-session=lightdm-gtk-greeter
+            EOF
+            
+            # 启用图形界面
+            sudo chroot rootfs systemctl set-default graphical.target
             sudo chroot rootfs systemctl enable lightdm
+          else
+            # 服务器版使用多用户目标
+            sudo chroot rootfs systemctl set-default multi-user.target
           fi
+      
+      - name: 配置用户和权限
+        run: |
+          # 创建 kali 用户（如果不存在）
+          sudo chroot rootfs id -u kali &>/dev/null || \
+            sudo chroot rootfs useradd -m -G sudo,audio,video,netdev -s /bin/bash kali
           
-          # 修复：设置图形界面为默认启动（添加）
-          sudo chroot rootfs systemctl set-default graphical.target
-          
-          # 修复：配置自动登录（添加）
-          sudo mkdir -p rootfs/etc/lightdm
-          echo "[Seat:*]" | sudo tee rootfs/etc/lightdm/lightdm.conf
-          echo "autologin-user=kali" | sudo tee -a rootfs/etc/lightdm/lightdm.conf
-          echo "autologin-user-timeout=0" | sudo tee -a rootfs/etc/lightdm/lightdm.conf
-          echo "user-session=xfce" | sudo tee -a rootfs/etc/lightdm/lightdm.conf
-          
-          # 用户配置
+          # 设置密码
           echo "root:kali" | sudo chroot rootfs chpasswd
-          sudo chroot rootfs useradd -m -G sudo -s /bin/bash kali 2>/dev/null || true
           echo "kali:kali" | sudo chroot rootfs chpasswd
           
-          # SSH配置
-          echo "PermitRootLogin yes" | sudo tee -a rootfs/etc/ssh/sshd_config
-          echo "PasswordAuthentication yes" | sudo tee -a rootfs/etc/ssh/sshd_config
+          # 配置 sudo 免密
+          echo "kali ALL=(ALL) NOPASSWD: ALL" | sudo tee rootfs/etc/sudoers.d/kali-nopasswd
+          sudo chmod 440 rootfs/etc/sudoers.d/kali-nopasswd
+          
+          # SSH 配置
+          cat << 'EOF' | sudo tee rootfs/etc/ssh/sshd_config.d/allow-root.conf
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          EOF
       
-      - name: 安装内核
+      - name: 安装内核和固件
         run: |
-          sudo cp debs/*.deb rootfs/tmp/ 2>/dev/null || {
-            echo "错误: 未找到内核deb包"
-            exit 1
-          }
+          echo ">>> 复制内核包到目标系统"
+          sudo cp debs/*.deb rootfs/tmp/
           
-          echo ">>> 安装内核"
-          sudo chroot rootfs apt-get update
-          sudo chroot rootfs apt-get clean
-          
+          echo ">>> 安装内核包"
           sudo chroot rootfs bash -c "
             cd /tmp
             dpkg -i *.deb 2>/dev/null || true
-            apt-get install -f -y
-            dpkg --configure -a 2>/dev/null || true
+            apt-get install -f -y --no-install-recommends
+            dpkg --configure -a
           "
           
-          KERNEL_DIR=$(ls rootfs/lib/modules/ | head -1)
+          # 生成 initramfs
+          KERNEL_DIR=$(ls rootfs/lib/modules/ 2>/dev/null | head -1)
           if [[ -n "$KERNEL_DIR" ]]; then
-            sudo chroot rootfs update-initramfs -c -k "$KERNEL_DIR" 2>/dev/null || true
+            echo ">>> 生成 initramfs for $KERNEL_DIR"
+            sudo chroot rootfs update-initramfs -c -k "$KERNEL_DIR" || \
+              sudo chroot rootfs update-initramfs -u -k all
           fi
           
+          # 创建启动符号链接
           sudo chroot rootfs bash -c '
             cd /boot
-            KERNEL=$(ls vmlinuz-* 2>/dev/null | head -1)
-            INITRD=$(ls initrd.img-* 2>/dev/null | head -1)
+            KERNEL=$(ls -t vmlinuz-* 2>/dev/null | head -1)
+            INITRD=$(ls -t initrd.img-* 2>/dev/null | head -1)
             [ -n "$KERNEL" ] && ln -sf "$KERNEL" vmlinuz
             [ -n "$INITRD" ] && ln -sf "$INITRD" initrd.img
-            ls -la
+            echo "启动文件:"
+            ls -la vmlinuz* initrd.img* 2>/dev/null || echo "未找到启动文件"
           '
       
-      - name: 配置引导
+      - name: 配置引导加载器
         run: |
-          sudo chroot rootfs apt-get install -y grub-efi-arm64 2>/dev/null || true
+          # 安装 GRUB EFI（仅桌面版）
+          SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
           
-          echo "PARTLABEL=linux / ext4 errors=remount-ro 0 1" | sudo tee rootfs/etc/fstab
-          echo "PARTLABEL=esp /boot/efi vfat umask=0077 0 1" | sudo tee -a rootfs/etc/fstab
+          if [[ "$SYSTEM_TYPE" != "kali-server" ]]; then
+            sudo chroot rootfs apt-get install -y grub-efi-arm64 shim-signed || true
+          fi
+          
+          # 配置 fstab
+          cat << 'EOF' | sudo tee rootfs/etc/fstab
+          # <file system>             <mount point>  <type>  <options>          <dump>  <pass>
+          PARTLABEL=linux-root        /              ext4    errors=remount-ro  0       1
+          PARTLABEL=esp               /boot/efi      vfat    umask=0077         0       1
+          tmpfs                       /tmp           tmpfs   defaults,nosuid    0       0
+          EOF
           
           sudo mkdir -p rootfs/boot/efi
       
-      - name: 清理和压缩
+      - name: 清理和卸载
         run: |
-          sudo chroot rootfs apt-get clean 2>/dev/null || true
-          sudo rm -rf rootfs/var/lib/apt/lists/* rootfs/tmp/* 2>/dev/null || true
+          echo ">>> 清理系统"
+          sudo chroot rootfs apt-get clean
+          sudo chroot rootfs apt-get autoremove -y
+          sudo rm -rf rootfs/var/lib/apt/lists/* \
+                     rootfs/tmp/* \
+                     rootfs/var/tmp/* \
+                     rootfs/var/log/* \
+                     rootfs/root/.bash_history
           
-          sudo umount rootfs/dev 2>/dev/null || true
-          sudo umount rootfs/proc 2>/dev/null || true
-          sudo umount rootfs/sys 2>/dev/null || true
-          sudo umount rootfs 2>/dev/null || true
+          # 确保所有进程停止
+          sudo fuser -k rootfs/tmp 2>/dev/null || true
           
-          ROOTFS_IMG="rootfs-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}.img"
-          xz -T0 -v "$ROOTFS_IMG"
+          echo ">>> 卸载文件系统"
+          sudo umount -l rootfs/dev/pts 2>/dev/null || true
+          sudo umount -l rootfs/dev 2>/dev/null || true
+          sudo umount -l rootfs/proc 2>/dev/null || true
+          sudo umount -l rootfs/sys 2>/dev/null || true
+          sudo umount -l rootfs 2>/dev/null || true
+          
+          # 等待卸载完成
+          sleep 2
       
-      - name: 发布
+      - name: 压缩镜像
+        run: |
+          ROOTFS_IMG=$(cat .img_name)
+          echo ">>> 压缩 $ROOTFS_IMG"
+          
+          # 使用最大压缩级别，多线程压缩
+          xz -T0 -9ev "$ROOTFS_IMG"
+          
+          ls -lh "${ROOTFS_IMG}.xz"
+      
+      - name: 发布到 Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: kali-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}
-          name: "Kali ${{ github.event.inputs.system_type }} ${{ github.event.inputs.kernel_version }}"
+          tag_name: kali-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}-${{ github.run_number }}
+          name: "Kali ${{ github.event.inputs.system_type }} ${{ github.event.inputs.kernel_version }} (Build ${{ github.run_number }})"
+          body: |
+            自动构建的 Kali Linux Rootfs 镜像
+            
+            **系统类型:** ${{ github.event.inputs.system_type }}
+            **内核版本:** ${{ github.event.inputs.kernel_version }}
+            **桌面环境:** ${{ github.event.inputs.desktop_env }}
+            **构建时间:** ${{ github.event.head_commit.timestamp }}
+            
+            ## 使用说明
+            
+            1. 下载并解压镜像：`unxz rootfs-*.img.xz`
+            2. 写入到分区：`dd if=rootfs-*.img of=/dev/mmcblk0p2 bs=4M status=progress`
+            3. 调整文件系统大小：`resize2fs /dev/mmcblk0p2`
+            
+            ## 默认账户
+            
+            - 用户名: `kali`
+            - 密码: `kali`
+            - Root 密码: `kali`
+            
+            **注意:** 桌面版已配置自动登录，启动后直接进入 XFCE 桌面。
           files: rootfs-*.img.xz
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
