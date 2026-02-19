@@ -20,27 +20,22 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
       
-      - name: 下载依赖
+      - name: 安装依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             mtools dosfstools e2fsprogs xz-utils wget cpio
       
-      - name: 下载内核包和 rootfs
+      - name: 下载内核包
         run: |
           mkdir -p build
           cd build
           
-          # 下载内核包
           echo ">>> 下载内核包..."
           wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/linux-image-xiaomi-raphael.deb"
           wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/linux-headers-xiaomi-raphael.deb"
           wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/firmware-xiaomi-raphael.deb"
           wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/alsa-xiaomi-raphael.deb"
-          
-          # 下载对应的 rootfs（用于提取版本信息）
-          echo ">>> 下载 rootfs 信息..."
-          wget -q "https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.rootfs_tag }}/rootfs-kali-desktop-${{ github.event.inputs.kernel_version }}.img.xz" -O rootfs.img.xz || true
           
           ls -la *.deb
       
@@ -52,41 +47,75 @@ jobs:
           
           # 解压 deb 包
           ar x ../linux-image-xiaomi-raphael.deb
-          tar -xf data.tar.xz
+          
+          # 查看解压出的文件
+          echo ">>> 解压出的文件:"
+          ls -la
+          
+          # 查找 data.tar.*（可能是 .xz 或 .gz）
+          DATA_TAR=$(ls data.tar.* 2>/dev/null | head -1)
+          
+          if [ -z "$DATA_TAR" ]; then
+            echo "错误: 找不到 data.tar.* 文件"
+            exit 1
+          fi
+          
+          echo ">>> 解压 $DATA_TAR"
+          tar -xf "$DATA_TAR"
           
           # 查找内核文件
           echo ">>> 查找内核文件..."
-          find . -name "vmlinuz-*" -o -name "Image-*" | head -5
-          find . -name "*.dtb" | head -5
+          find . -name "vmlinuz-*" -o -name "Image-*" 2>/dev/null | head -5
+          find . -name "*.dtb" 2>/dev/null | head -5
           
           # 复制内核文件到 build 目录
           KERNEL_FILE=$(find . -name "vmlinuz-*" | head -1)
-          DTB_FILE=$(find . -path "*/qcom/sm8150-xiaomi-raphael.dtb" | head -1)
           
           if [ -z "$KERNEL_FILE" ]; then
-            echo "错误: 找不到内核文件"
+            # 尝试找 Image 文件
+            KERNEL_FILE=$(find . -name "Image-*" -o -name "Image" | head -1)
+          fi
+          
+          if [ -z "$KERNEL_FILE" ]; then
+            echo "错误: 找不到内核文件 (vmlinuz-* 或 Image-*)"
+            find . -type f | head -20
             exit 1
           fi
           
           cp "$KERNEL_FILE" ../vmlinuz
-          cp "$DTB_FILE" ../dtb || echo "警告: 未找到 dtb 文件"
+          
+          # 查找 dtb 文件
+          DTB_FILE=$(find . -path "*/qcom/sm8150-xiaomi-raphael.dtb" | head -1)
+          if [ -z "$DTB_FILE" ]; then
+            DTB_FILE=$(find . -name "*raphael*.dtb" | head -1)
+          fi
+          if [ -z "$DTB_FILE" ]; then
+            DTB_FILE=$(find . -name "sm8150*.dtb" | head -1)
+          fi
+          
+          if [ -n "$DTB_FILE" ]; then
+            cp "$DTB_FILE" ../dtb
+            echo ">>> 找到 dtb: $DTB_FILE"
+          else
+            echo "警告: 未找到 dtb 文件"
+          fi
           
           # 获取内核版本
-          KERNEL_VERSION=$(basename "$KERNEL_FILE" | sed 's/vmlinuz-//')
+          KERNEL_VERSION=$(basename "$KERNEL_FILE" | sed 's/vmlinuz-//' | sed 's/Image-//')
           echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
-          echo "找到内核版本: $KERNEL_VERSION"
+          echo ">>> 内核版本: $KERNEL_VERSION"
           
           cd ..
-          ls -la vmlinuz dtb
+          ls -la vmlinuz dtb 2>/dev/null || ls -la vmlinuz
       
       - name: 创建 initramfs
         run: |
           cd build
           
           # 创建临时目录构建 initramfs
-          mkdir -p initramfs/{bin,sbin,lib,lib64,usr,dev,proc,sys,tmp,run}
+          mkdir -p initramfs/{bin,sbin,lib,lib64,usr,dev,proc,sys,tmp,run,etc}
           
-          # 复制必要的工具
+          # 安装 busybox
           sudo apt-get install -y busybox-static
           
           # 创建基本 init 脚本
@@ -132,13 +161,18 @@ jobs:
           
           chmod +x initramfs/init
           
-          # 复制 busybox
+          # 复制 busybox 并创建链接
           cp /bin/busybox initramfs/bin/
           cd initramfs/bin
-          for cmd in sh echo mount umount sleep mkdir cat; do
+          for cmd in sh echo mount umount sleep mkdir cat ln ls; do
             ln -s busybox $cmd
           done
           cd ../..
+          
+          # 创建必要的设备节点
+          mkdir -p initramfs/dev
+          mknod initramfs/dev/null c 1 3 2>/dev/null || true
+          mknod initramfs/dev/console c 5 1 2>/dev/null || true
           
           # 打包 initramfs
           cd initramfs
@@ -183,7 +217,7 @@ jobs:
           # 复制内核文件到 boot 目录
           cp vmlinuz boot/
           cp initrd.img boot/
-          cp dtb boot/ 2>/dev/null || echo "警告: dtb 未复制"
+          [ -f dtb ] && cp dtb boot/
           
           ls -la boot/
           cat boot/grub/grub.cfg
@@ -199,7 +233,7 @@ jobs:
           # 格式化为 FAT32
           mkfs.vfat -F32 -n "KALI-BOOT" boot.img
           
-          # 使用 mtools 复制文件（不需要挂载）
+          # 使用 mtools 复制文件
           mcopy -i boot.img boot/vmlinuz ::vmlinuz
           mcopy -i boot.img boot/initrd.img ::initrd.img
           [ -f boot/dtb ] && mcopy -i boot.img boot/dtb ::dtb
@@ -209,13 +243,29 @@ jobs:
           mmd -i boot.img ::EFI/boot
           mcopy -i boot.img boot/grub/grub.cfg ::EFI/boot/grub.cfg
           
-          # 复制 GRUB EFI 文件（从系统中获取）
-          if [ -f /usr/lib/grub/arm64-efi/monolithic/grubaa64.efi ]; then
-            mcopy -i boot.img /usr/lib/grub/arm64-efi/monolithic/grubaa64.efi ::EFI/boot/BOOTAA64.EFI
-          elif [ -f /usr/lib/grub/arm64-efi/grub.efi ]; then
-            mcopy -i boot.img /usr/lib/grub/arm64-efi/grub.efi ::EFI/boot/BOOTAA64.EFI
+          # 尝试获取 GRUB EFI 文件
+          echo ">>> 查找 GRUB EFI 文件..."
+          find /usr -name "grubaa64.efi" -o -name "grub.efi" 2>/dev/null | head -5
+          
+          # 复制 GRUB EFI 文件
+          GRUB_EFI=$(find /usr -name "grubaa64.efi" 2>/dev/null | head -1)
+          if [ -z "$GRUB_EFI" ]; then
+            GRUB_EFI=$(find /usr -name "grub.efi" 2>/dev/null | head -1)
+          fi
+          
+          if [ -n "$GRUB_EFI" ]; then
+            echo ">>> 使用 GRUB EFI: $GRUB_EFI"
+            mcopy -i boot.img "$GRUB_EFI" ::EFI/boot/BOOTAA64.EFI
           else
-            echo "警告: 未找到 GRUB EFI 文件，需要手动添加"
+            echo "警告: 未找到 GRUB EFI 文件，尝试安装 grub-efi-arm64"
+            sudo apt-get install -y grub-efi-arm64-bin
+            GRUB_EFI=$(find /usr -name "grubaa64.efi" 2>/dev/null | head -1)
+            if [ -n "$GRUB_EFI" ]; then
+              mcopy -i boot.img "$GRUB_EFI" ::EFI/boot/BOOTAA64.EFI
+            else
+              echo "错误: 无法找到 GRUB EFI 文件"
+              exit 1
+            fi
           fi
           
           # 验证内容
