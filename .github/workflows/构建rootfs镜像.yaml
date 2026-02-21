@@ -247,6 +247,9 @@ jobs:
         run: |
           echo ">>> 生成动态GRUB配置"
           
+          # 先创建grub目录
+          sudo mkdir -p rootfs/boot/grub
+          
           # 获取实际的内核文件名用于生成grub.cfg
           sudo chroot rootfs bash -c '
             cd /boot
