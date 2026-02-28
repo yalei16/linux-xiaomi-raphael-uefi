@@ -28,7 +28,6 @@ jobs:
           binfmt-support \
           debootstrap \
           abootimg \
-          mkbootimg \
           device-tree-compiler \
           android-sdk-libsparse-utils \
           gcc-aarch64-linux-gnu \
@@ -199,40 +198,30 @@ jobs:
         
         ls -lh ${{ env.BUILD_DIR }}/initramfs.gz
 
-    - name: Build boot.img
-      run: |
+        - name: Build boot.img
+          run: |
         mkdir -p ${{ env.OUTPUT_DIR }}
         
-        KERNEL="${{ env.KERNEL_PATH }}"
+        KERNEL="$KERNEL_PATH"
         INITRAMFS="${{ env.BUILD_DIR }}/initramfs.gz"
         OUTPUT="${{ env.OUTPUT_DIR }}/kali-raphael-live.img"
         
-        # Raphael专用参数
+        # Raphael 专用启动参数
         CMDLINE="console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.console=ttyMSM0 androidboot.memcg=1 lpm_levels.sleep_disabled=1 androidboot.usbcontroller=a600000.dwc3 buildvariant=userdebug init=/init rw"
         
-        if command -v mkbootimg &> /dev/null; then
-          mkbootimg \
-            --kernel "$KERNEL" \
-            --ramdisk "$INITRAMFS" \
-            --cmdline "$CMDLINE" \
-            --base 0x00000000 \
-            --pagesize 4096 \
-            --kernel_offset 0x00008000 \
-            --ramdisk_offset 0x01000000 \
-            --tags_offset 0x00000100 \
-            --os_version "11.0.0" \
-            --os_patch_level "$(date +%Y-%m)" \
-            -o "$OUTPUT"
-        else
-          abootimg --create "$OUTPUT" \
-            -k "$KERNEL" \
-            -r "$INITRAMFS" \
-            -c "cmdline = ${CMDLINE}" \
-            -c "pagesize = 4096"
-        fi
+        # 使用 abootimg 替代 mkbootimg（Ubuntu 24.04 的 mkbootimg 有 Python GKI 模块缺失问题）
+        abootimg --create "$OUTPUT" \
+          -k "$KERNEL" \
+          -r "$INITRAMFS" \
+          -c "pagesize = 4096" \
+          -c "kerneladdr = 0x00008000" \
+          -c "ramdiskaddr = 0x01000000" \
+          -c "secondaddr = 0x00f00000" \
+          -c "tagsaddr = 0x00000100" \
+          -c "cmdline = ${CMDLINE}"
         
         echo "::set-output name=bootimg::$OUTPUT"
-        ls -lh $OUTPUT
+        ls -lh "$OUTPUT"
 
     - name: Generate flash script
       run: |
