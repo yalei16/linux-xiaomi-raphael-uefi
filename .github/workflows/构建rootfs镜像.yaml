@@ -3,9 +3,7 @@ name: Build Kali Live Boot for Raphael
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:  # 支持手动触发
+  workflow_dispatch:
 
 env:
   DEB_URL_BASE: "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18"
@@ -21,276 +19,95 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Install build dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          qemu-user-static \
-          binfmt-support \
-          debootstrap \
-          abootimg \
-          device-tree-compiler \
-          android-sdk-libsparse-utils \
-          gcc-aarch64-linux-gnu \
-          cpio \
-          gzip \
-          xz-utils \
-          zstd \
-          git \
-          wget \
-          file
+      run: sudo apt-get update && sudo apt-get install -y qemu-user-static binfmt-support debootstrap abootimg device-tree-compiler gcc-aarch64-linux-gnu cpio gzip wget file
 
-    - name: Download Xiaomi Raphael kernel packages
+    - name: Download kernel packages
       run: |
         mkdir -p ${{ env.BUILD_DIR }}/debs
         cd ${{ env.BUILD_DIR }}/debs
-        
-        echo "::group::Downloading kernel packages..."
-        wget -q --show-progress "${{ env.DEB_URL_BASE }}/linux-image-xiaomi-raphael.deb" \
-          -O linux-image-xiaomi-raphael.deb
-        wget -q --show-progress "${{ env.DEB_URL_BASE }}/linux-headers-xiaomi-raphael.deb" \
-          -O linux-headers-xiaomi-raphael.deb
-        wget -q --show-progress "${{ env.DEB_URL_BASE }}/firmware-xiaomi-raphael.deb" \
-          -O firmware-xiaomi-raphael.deb
-        wget -q --show-progress "${{ env.DEB_URL_BASE }}/alsa-xiaomi-raphael.deb" \
-          -O alsa-xiaomi-raphael.deb
-        echo "::endgroup::"
-        
-        # 验证下载
+        wget -q "${{ env.DEB_URL_BASE }}/linux-image-xiaomi-raphael.deb"
+        wget -q "${{ env.DEB_URL_BASE }}/linux-headers-xiaomi-raphael.deb"
+        wget -q "${{ env.DEB_URL_BASE }}/firmware-xiaomi-raphael.deb"
+        wget -q "${{ env.DEB_URL_BASE }}/alsa-xiaomi-raphael.deb"
         ls -lh *.deb
-        file *.deb
 
-    - name: Extract kernel and firmware
+    - name: Extract kernel
       run: |
         mkdir -p ${{ env.BUILD_DIR }}/extract
-        cd ${{ env.BUILD_DIR }}/debs
-        
-        # 解压所有deb包
-        for deb in *.deb; do
-          echo "Extracting $deb..."
-          dpkg-deb -x "$deb" ${{ env.BUILD_DIR }}/extract/
-        done
-        
-        # 查找内核
+        for deb in ${{ env.BUILD_DIR }}/debs/*.deb; do dpkg-deb -x "$deb" ${{ env.BUILD_DIR }}/extract/; done
         KERNEL=$(find ${{ env.BUILD_DIR }}/extract -name "vmlinuz*" -type f | head -1)
-        if [ -z "$KERNEL" ]; then
-          echo "::error::Kernel image not found!"
-          exit 1
-        fi
-        
         echo "KERNEL_PATH=$KERNEL" >> $GITHUB_ENV
-        echo "KERNEL_VERSION=$(basename $KERNEL | sed 's/vmlinuz-//')" >> $GITHUB_ENV
-        echo "::notice::Found kernel: $KERNEL"
+        echo "Found kernel: $KERNEL"
 
-    - name: Build minimal Kali rootfs
+    - name: Build rootfs
       run: |
         sudo mkdir -p ${{ env.BUILD_DIR }}/rootfs
-        cd ${{ env.BUILD_DIR }}
-        
-        # 使用debootstrap创建arm64最小系统
-        sudo debootstrap --foreign --variant=minbase --arch=arm64 \
-          kali-rolling ./rootfs http://http.kali.org/kali
-        
-        # 准备chroot
-        sudo cp /usr/bin/qemu-aarch64-static ./rootfs/usr/bin/
-        sudo mount --bind /dev ./rootfs/dev
-        sudo mount --bind /proc ./rootfs/proc
-        sudo mount --bind /sys ./rootfs/sys
-        
-        # 第二阶段
-        sudo chroot ./rootfs /debootstrap/debootstrap --second-stage
-        
-        # 创建配置脚本
-        sudo tee ./rootfs/tmp/setup.sh > /dev/null << 'EOFSCRIPT'
+        sudo debootstrap --foreign --variant=minbase --arch=arm64 kali-rolling ${{ env.BUILD_DIR }}/rootfs http://http.kali.org/kali
+        sudo cp /usr/bin/qemu-aarch64-static ${{ env.BUILD_DIR }}/rootfs/usr/bin/
+
+    - name: Configure rootfs
+      run: |
+        sudo mount --bind /dev ${{ env.BUILD_DIR }}/rootfs/dev
+        sudo mount --bind /proc ${{ env.BUILD_DIR }}/rootfs/proc
+        sudo mount --bind /sys ${{ env.BUILD_DIR }}/rootfs/sys
+        sudo chroot ${{ env.BUILD_DIR }}/rootfs /debootstrap/debootstrap --second-stage
+        sudo tee ${{ env.BUILD_DIR }}/rootfs/tmp/setup.sh > /dev/null << 'EOFSCRIPT'
         #!/bin/bash
         set -e
-        
-        # 配置apt源
-        cat > /etc/apt/sources.list << 'EOF'
-        deb http://http.kali.org/kali kali-rolling main non-free contrib
-        deb-src http://http.kali.org/kali kali-rolling main non-free contrib
-        EOF
-        
-        apt-get update
-        
-        # 安装最小系统（ Busybox + 核心工具）
-        apt-get install -y --no-install-recommends \
-          busybox-static \
-          libc6 \
-          libncurses6 \
-          dropbear-bin \
-          wireless-tools \
-          wpasupplicant \
-          iproute2 \
-          iputils-ping \
-          net-tools \
-          usbutils \
-          kmod \
-          udev \
-          initramfs-tools
-        
-        # 设置root密码
         echo "root:toor" | chpasswd
-        
-        # 生成SSH密钥
+        apt-get update
+        apt-get install -y --no-install-recommends busybox-static dropbear-bin wireless-tools wpasupplicant iproute2 iputils-ping net-tools kmod udev
         mkdir -p /etc/dropbear
         dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key
         dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key
-        
-        # 创建init脚本
         cat > /init << 'EOFINIT'
         #!/bin/sh
-        echo "[*] Kali Linux Live Boot for Redmi K20 Pro"
-        
+        echo "[*] Kali Live Boot for Redmi K20 Pro"
         mount -t proc proc /proc
         mount -t sysfs sys /sys
         mount -t devtmpfs dev /dev
         mount -t tmpfs tmp /tmp
-        
-        # 启动设备管理
         echo /sbin/mdev > /proc/sys/kernel/hotplug
         mdev -s
-        
-        # 配置loopback
         ifconfig lo 127.0.0.1 up
-        
-        # 启动SSH
         /usr/sbin/dropbear -p 22
-        
-        # 尝试挂载数据分区（如果存在）
         mkdir -p /data
-        mount /dev/block/bootdevice/by-name/userdata /data 2>/dev/null || \
-        echo "[!] Running in RAM mode (no persistence)"
-        
-        echo "[+] System ready. Login: root/toor"
+        mount /dev/block/bootdevice/by-name/userdata /data 2>/dev/null || echo "[!] RAM mode"
+        echo "[+] Ready. Login: root/toor"
         exec /bin/sh
         EOFINIT
-        
         chmod +x /init
-        
-        # 安装busybox链接
         /bin/busybox --install -s /bin/
-        
-        # 清理
         rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* /tmp/* /var/tmp/*
         apt-get clean
         EOFSCRIPT
-        
-        sudo chmod +x ./rootfs/tmp/setup.sh
-        sudo chroot ./rootfs /tmp/setup.sh
-        
-        # 复制固件
-        if [ -d "./extract/lib/firmware" ]; then
-          sudo cp -r ./extract/lib/firmware/* ./rootfs/lib/firmware/ 2>/dev/null || true
-        fi
-        
-        # 卸载
-        sudo umount -l ./rootfs/dev 2>/dev/null || true
-        sudo umount -l ./rootfs/proc 2>/dev/null || true
-        sudo umount -l ./rootfs/sys 2>/dev/null || true
+        sudo chmod +x ${{ env.BUILD_DIR }}/rootfs/tmp/setup.sh
+        sudo chroot ${{ env.BUILD_DIR }}/rootfs /tmp/setup.sh
+        if [ -d "${{ env.BUILD_DIR }}/extract/lib/firmware" ]; then sudo cp -r ${{ env.BUILD_DIR }}/extract/lib/firmware/* ${{ env.BUILD_DIR }}/rootfs/lib/firmware/ 2>/dev/null || true; fi
+        sudo umount -l ${{ env.BUILD_DIR }}/rootfs/dev || true
+        sudo umount -l ${{ env.BUILD_DIR }}/rootfs/proc || true
+        sudo umount -l ${{ env.BUILD_DIR }}/rootfs/sys || true
 
-        - name: Create initramfs
-          run: |
-        # 进入 rootfs 目录
-        cd "${{ env.BUILD_DIR }}/rootfs"
-        
-        # 第一步：创建未压缩的 cpio 归档（无续行符）
-        sudo find . -print0 | sudo cpio --null --create --format=newc > "${{ env.BUILD_DIR }}/initramfs.cpio"
-        
-        # 第二步：压缩（独立命令）
-        gzip -9 "${{ env.BUILD_DIR }}/initramfs.cpio"
-        
-        # 第三步：重命名（因为 gzip 会添加 .gz 后缀）
-        mv "${{ env.BUILD_DIR }}/initramfs.cpio.gz" "${{ env.BUILD_DIR }}/initramfs.gz"
-        
-        # 验证
-        ls -lh "${{ env.BUILD_DIR }}/initramfs.gz"
+    - name: Create initramfs
+      run: |
+        cd ${{ env.BUILD_DIR }}/rootfs
+        sudo sh -c 'find . -print0 | cpio --null --create --format=newc > "${{ env.BUILD_DIR }}/initramfs.cpio"'
+        gzip -9 ${{ env.BUILD_DIR }}/initramfs.cpio
+        mv ${{ env.BUILD_DIR }}/initramfs.cpio.gz ${{ env.BUILD_DIR }}/initramfs.gz
+        ls -lh ${{ env.BUILD_DIR }}/initramfs.gz
 
-        - name: Build boot.img
-          run: |
+    - name: Build boot.img
+      run: |
         mkdir -p ${{ env.OUTPUT_DIR }}
-        
-        KERNEL="$KERNEL_PATH"
+        KERNEL="${{ env.KERNEL_PATH }}"
         INITRAMFS="${{ env.BUILD_DIR }}/initramfs.gz"
         OUTPUT="${{ env.OUTPUT_DIR }}/kali-raphael-live.img"
-        
-        # Raphael 专用启动参数
         CMDLINE="console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.console=ttyMSM0 androidboot.memcg=1 lpm_levels.sleep_disabled=1 androidboot.usbcontroller=a600000.dwc3 buildvariant=userdebug init=/init rw"
-        
-        # 使用 abootimg 替代 mkbootimg（Ubuntu 24.04 的 mkbootimg 有 Python GKI 模块缺失问题）
-        abootimg --create "$OUTPUT" \
-          -k "$KERNEL" \
-          -r "$INITRAMFS" \
-          -c "pagesize = 4096" \
-          -c "kerneladdr = 0x00008000" \
-          -c "ramdiskaddr = 0x01000000" \
-          -c "secondaddr = 0x00f00000" \
-          -c "tagsaddr = 0x00000100" \
-          -c "cmdline = ${CMDLINE}"
-        
-        echo "::set-output name=bootimg::$OUTPUT"
+        abootimg --create "$OUTPUT" -k "$KERNEL" -r "$INITRAMFS" -c "pagesize = 4096" -c "kerneladdr = 0x00008000" -c "ramdiskaddr = 0x01000000" -c "secondaddr = 0x00f00000" -c "tagsaddr = 0x00000100" -c "cmdline = ${CMDLINE}"
         ls -lh "$OUTPUT"
 
-    - name: Generate flash script
-      run: |
-        cat > ${{ env.OUTPUT_DIR }}/flash.sh << 'EOF'
-        #!/bin/bash
-        # Auto-generated flash script for Kali Raphael
-        set -e
-        
-        IMG="kali-raphael-live.img"
-        
-        if [ ! -f "$IMG" ]; then
-            echo "Error: $IMG not found!"
-            exit 1
-        fi
-        
-        echo "=== Flashing Kali Live Boot to Raphael ==="
-        
-        # Auto-detect device
-        if adb devices | grep -q "device$"; then
-            echo "[*] Rebooting to bootloader..."
-            adb reboot bootloader
-            sleep 5
-        fi
-        
-        fastboot flash boot_a "$IMG"
-        fastboot flash boot_b "$IMG"
-        fastboot reboot
-        
-        echo "[+] Done! Device rebooting..."
-        echo "[+] Connect via: adb shell"
-        EOF
-        
-        chmod +x ${{ env.OUTPUT_DIR }}/flash.sh
-
-    - name: Upload artifacts
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: kali-raphael-live-boot
-        path: |
-          ${{ env.OUTPUT_DIR }}/kali-raphael-live.img
-          ${{ env.OUTPUT_DIR }}/flash.sh
-        retention-days: 30
-
-    - name: Create Release
-      if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          ${{ env.OUTPUT_DIR }}/kali-raphael-live.img
-          ${{ env.OUTPUT_DIR }}/flash.sh
-        body: |
-          Kali Linux Live Boot for Redmi K20 Pro (raphael)
-          
-          **Features:**
-          - Self-contained boot.img (no rootfs required)
-          - Runs entirely in RAM
-          - Dropbear SSH enabled (root/toor)
-          - WiFi support included
-          
-          **Flash:**
-          ```bash
-          fastboot flash boot kali-raphael-live.img
-          ```
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: kali-raphael-boot
+        path: ${{ env.OUTPUT_DIR }}/kali-raphael-live.img
