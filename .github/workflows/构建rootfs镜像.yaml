@@ -189,7 +189,7 @@ jobs:
         sudo umount -l ./rootfs/sys 2>/dev/null || true
 
         - name: Create initramfs
-      run: |
+          run: |
         # 进入 rootfs 目录
         cd "${{ env.BUILD_DIR }}/rootfs"
         
