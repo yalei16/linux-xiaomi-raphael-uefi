@@ -1,335 +1,300 @@
-name: 构建系统镜像
+name: Build Kali Live Boot for Raphael
 
 on:
-  workflow_dispatch:
-    inputs:
-      system_type:
-        description: '系统类型'
-        required: true
-        default: 'kali-desktop'
-        type: choice
-        options:
-          - kali-desktop
-          - kali-server
-          - kali-nethunter
-      
-      kernel_version:
-        description: '内核版本号（如 6.18）'
-        required: true
-        type: string
-      
-      desktop_env:
-        description: '桌面环境（仅桌面版有效）'
-        required: false
-        default: 'xfce-full'
-        type: choice
-        options:
-          - xfce-full
-          - xfce-minimal
-          - none
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # 支持手动触发
+
+env:
+  DEB_URL_BASE: "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18"
+  BUILD_DIR: ${{ github.workspace }}/build
+  OUTPUT_DIR: ${{ github.workspace }}/output
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-      
-      - name: 安装依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            debootstrap parted e2fsprogs xz-utils
-      
-      - name: 下载内核包
-        run: |
-          mkdir -p debs
-          cd debs
-          
-          echo "下载内核包..."
-          
-          # 你的固定下载地址
-          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/linux-image-xiaomi-raphael.deb"
-          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/linux-headers-xiaomi-raphael.deb"
-          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/firmware-xiaomi-raphael.deb"
-          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18/alsa-xiaomi-raphael.deb"
-          
-          echo "下载完成:"
-          ls -la *.deb
-          
-          # 验证
-          if [[ ! -f "linux-image-xiaomi-raphael.deb" ]]; then
-            echo "错误: 内核包下载失败"
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          qemu-user-static \
+          binfmt-support \
+          debootstrap \
+          abootimg \
+          mkbootimg \
+          device-tree-compiler \
+          android-sdk-libsparse-utils \
+          gcc-aarch64-linux-gnu \
+          cpio \
+          gzip \
+          xz-utils \
+          zstd \
+          git \
+          wget \
+          file
+
+    - name: Download Xiaomi Raphael kernel packages
+      run: |
+        mkdir -p ${{ env.BUILD_DIR }}/debs
+        cd ${{ env.BUILD_DIR }}/debs
+        
+        echo "::group::Downloading kernel packages..."
+        wget -q --show-progress "${{ env.DEB_URL_BASE }}/linux-image-xiaomi-raphael.deb" \
+          -O linux-image-xiaomi-raphael.deb
+        wget -q --show-progress "${{ env.DEB_URL_BASE }}/linux-headers-xiaomi-raphael.deb" \
+          -O linux-headers-xiaomi-raphael.deb
+        wget -q --show-progress "${{ env.DEB_URL_BASE }}/firmware-xiaomi-raphael.deb" \
+          -O firmware-xiaomi-raphael.deb
+        wget -q --show-progress "${{ env.DEB_URL_BASE }}/alsa-xiaomi-raphael.deb" \
+          -O alsa-xiaomi-raphael.deb
+        echo "::endgroup::"
+        
+        # 验证下载
+        ls -lh *.deb
+        file *.deb
+
+    - name: Extract kernel and firmware
+      run: |
+        mkdir -p ${{ env.BUILD_DIR }}/extract
+        cd ${{ env.BUILD_DIR }}/debs
+        
+        # 解压所有deb包
+        for deb in *.deb; do
+          echo "Extracting $deb..."
+          dpkg-deb -x "$deb" ${{ env.BUILD_DIR }}/extract/
+        done
+        
+        # 查找内核
+        KERNEL=$(find ${{ env.BUILD_DIR }}/extract -name "vmlinuz*" -type f | head -1)
+        if [ -z "$KERNEL" ]; then
+          echo "::error::Kernel image not found!"
+          exit 1
+        fi
+        
+        echo "KERNEL_PATH=$KERNEL" >> $GITHUB_ENV
+        echo "KERNEL_VERSION=$(basename $KERNEL | sed 's/vmlinuz-//')" >> $GITHUB_ENV
+        echo "::notice::Found kernel: $KERNEL"
+
+    - name: Build minimal Kali rootfs
+      run: |
+        sudo mkdir -p ${{ env.BUILD_DIR }}/rootfs
+        cd ${{ env.BUILD_DIR }}
+        
+        # 使用debootstrap创建arm64最小系统
+        sudo debootstrap --foreign --variant=minbase --arch=arm64 \
+          kali-rolling ./rootfs http://http.kali.org/kali
+        
+        # 准备chroot
+        sudo cp /usr/bin/qemu-aarch64-static ./rootfs/usr/bin/
+        sudo mount --bind /dev ./rootfs/dev
+        sudo mount --bind /proc ./rootfs/proc
+        sudo mount --bind /sys ./rootfs/sys
+        
+        # 第二阶段
+        sudo chroot ./rootfs /debootstrap/debootstrap --second-stage
+        
+        # 创建配置脚本
+        sudo tee ./rootfs/tmp/setup.sh > /dev/null << 'EOFSCRIPT'
+        #!/bin/bash
+        set -e
+        
+        # 配置apt源
+        cat > /etc/apt/sources.list << 'EOF'
+        deb http://http.kali.org/kali kali-rolling main non-free contrib
+        deb-src http://http.kali.org/kali kali-rolling main non-free contrib
+        EOF
+        
+        apt-get update
+        
+        # 安装最小系统（ Busybox + 核心工具）
+        apt-get install -y --no-install-recommends \
+          busybox-static \
+          libc6 \
+          libncurses6 \
+          dropbear-bin \
+          wireless-tools \
+          wpasupplicant \
+          iproute2 \
+          iputils-ping \
+          net-tools \
+          usbutils \
+          kmod \
+          udev \
+          initramfs-tools
+        
+        # 设置root密码
+        echo "root:toor" | chpasswd
+        
+        # 生成SSH密钥
+        mkdir -p /etc/dropbear
+        dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key
+        dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key
+        
+        # 创建init脚本
+        cat > /init << 'EOFINIT'
+        #!/bin/sh
+        echo "[*] Kali Linux Live Boot for Redmi K20 Pro"
+        
+        mount -t proc proc /proc
+        mount -t sysfs sys /sys
+        mount -t devtmpfs dev /dev
+        mount -t tmpfs tmp /tmp
+        
+        # 启动设备管理
+        echo /sbin/mdev > /proc/sys/kernel/hotplug
+        mdev -s
+        
+        # 配置loopback
+        ifconfig lo 127.0.0.1 up
+        
+        # 启动SSH
+        /usr/sbin/dropbear -p 22
+        
+        # 尝试挂载数据分区（如果存在）
+        mkdir -p /data
+        mount /dev/block/bootdevice/by-name/userdata /data 2>/dev/null || \
+        echo "[!] Running in RAM mode (no persistence)"
+        
+        echo "[+] System ready. Login: root/toor"
+        exec /bin/sh
+        EOFINIT
+        
+        chmod +x /init
+        
+        # 安装busybox链接
+        /bin/busybox --install -s /bin/
+        
+        # 清理
+        rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* /tmp/* /var/tmp/*
+        apt-get clean
+        EOFSCRIPT
+        
+        sudo chmod +x ./rootfs/tmp/setup.sh
+        sudo chroot ./rootfs /tmp/setup.sh
+        
+        # 复制固件
+        if [ -d "./extract/lib/firmware" ]; then
+          sudo cp -r ./extract/lib/firmware/* ./rootfs/lib/firmware/ 2>/dev/null || true
+        fi
+        
+        # 卸载
+        sudo umount -l ./rootfs/dev 2>/dev/null || true
+        sudo umount -l ./rootfs/proc 2>/dev/null || true
+        sudo umount -l ./rootfs/sys 2>/dev/null || true
+
+    - name: Create initramfs
+      run: |
+        cd ${{ env.BUILD_DIR }}/rootfs
+        
+        # 打包为cpio.gz
+        sudo find . -print0 | sudo cpio --null --create --verbose --format=newc | \
+          gzip -9 > ${{ env.BUILD_DIR }}/initramfs.gz
+        
+        ls -lh ${{ env.BUILD_DIR }}/initramfs.gz
+
+    - name: Build boot.img
+      run: |
+        mkdir -p ${{ env.OUTPUT_DIR }}
+        
+        KERNEL="${{ env.KERNEL_PATH }}"
+        INITRAMFS="${{ env.BUILD_DIR }}/initramfs.gz"
+        OUTPUT="${{ env.OUTPUT_DIR }}/kali-raphael-live.img"
+        
+        # Raphael专用参数
+        CMDLINE="console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.console=ttyMSM0 androidboot.memcg=1 lpm_levels.sleep_disabled=1 androidboot.usbcontroller=a600000.dwc3 buildvariant=userdebug init=/init rw"
+        
+        if command -v mkbootimg &> /dev/null; then
+          mkbootimg \
+            --kernel "$KERNEL" \
+            --ramdisk "$INITRAMFS" \
+            --cmdline "$CMDLINE" \
+            --base 0x00000000 \
+            --pagesize 4096 \
+            --kernel_offset 0x00008000 \
+            --ramdisk_offset 0x01000000 \
+            --tags_offset 0x00000100 \
+            --os_version "11.0.0" \
+            --os_patch_level "$(date +%Y-%m)" \
+            -o "$OUTPUT"
+        else
+          abootimg --create "$OUTPUT" \
+            -k "$KERNEL" \
+            -r "$INITRAMFS" \
+            -c "cmdline = ${CMDLINE}" \
+            -c "pagesize = 4096"
+        fi
+        
+        echo "::set-output name=bootimg::$OUTPUT"
+        ls -lh $OUTPUT
+
+    - name: Generate flash script
+      run: |
+        cat > ${{ env.OUTPUT_DIR }}/flash.sh << 'EOF'
+        #!/bin/bash
+        # Auto-generated flash script for Kali Raphael
+        set -e
+        
+        IMG="kali-raphael-live.img"
+        
+        if [ ! -f "$IMG" ]; then
+            echo "Error: $IMG not found!"
             exit 1
-          fi
-      
-      - name: 构建系统镜像
-        run: |
-          SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
-          KERNEL_VER="${{ github.event.inputs.kernel_version }}"
-          ROOTFS_IMG="rootfs-${SYSTEM_TYPE}-${KERNEL_VER}.img"
+        fi
+        
+        echo "=== Flashing Kali Live Boot to Raphael ==="
+        
+        # Auto-detect device
+        if adb devices | grep -q "device$"; then
+            echo "[*] Rebooting to bootloader..."
+            adb reboot bootloader
+            sleep 5
+        fi
+        
+        fastboot flash boot_a "$IMG"
+        fastboot flash boot_b "$IMG"
+        fastboot reboot
+        
+        echo "[+] Done! Device rebooting..."
+        echo "[+] Connect via: adb shell"
+        EOF
+        
+        chmod +x ${{ env.OUTPUT_DIR }}/flash.sh
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: kali-raphael-live-boot
+        path: |
+          ${{ env.OUTPUT_DIR }}/kali-raphael-live.img
+          ${{ env.OUTPUT_DIR }}/flash.sh
+        retention-days: 30
+
+    - name: Create Release
+      if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          ${{ env.OUTPUT_DIR }}/kali-raphael-live.img
+          ${{ env.OUTPUT_DIR }}/flash.sh
+        body: |
+          Kali Linux Live Boot for Redmi K20 Pro (raphael)
           
-          echo "构建: $SYSTEM_TYPE"
-          echo "内核: $KERNEL_VER"
-          echo "输出: $ROOTFS_IMG"
+          **Features:**
+          - Self-contained boot.img (no rootfs required)
+          - Runs entirely in RAM
+          - Dropbear SSH enabled (root/toor)
+          - WiFi support included
           
-          truncate -s 10G "$ROOTFS_IMG"
-          mkfs.ext4 -F -L "linux" "$ROOTFS_IMG"
-          
-          mkdir -p rootfs
-          sudo mount -o loop "$ROOTFS_IMG" rootfs
-      
-      - name: 安装Kali基础系统
-        run: |
-          echo ">>> 构建 Kali Linux"
-          sudo debootstrap --foreign --arch=arm64 kali-rolling rootfs http://mirrors.tuna.tsinghua.edu.cn/kali
-          
-          sudo chroot rootfs /debootstrap/debootstrap --second-stage
-          
-          echo "deb http://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
-          echo "kali-raphael" | sudo tee rootfs/etc/hostname
-          echo "127.0.0.1 localhost" | sudo tee rootfs/etc/hosts
-          echo "127.0.1.1 kali-raphael" | sudo tee -a rootfs/etc/hosts
-      
-      - name: 配置系统
-        run: |
-          sudo mount --bind /dev rootfs/dev
-          sudo mount --bind /proc rootfs/proc
-          sudo mount --bind /sys rootfs/sys
-          
-          sudo chroot rootfs apt-get update
-          sudo chroot rootfs apt-get upgrade -y
-      
-      - name: 安装软件包
-        run: |
-          SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
-          DESKTOP_ENV="${{ github.event.inputs.desktop_env }}"
-          
-          sudo chroot rootfs apt-get install -y \
-            sudo ssh openssh-server \
-            initramfs-tools curl wget \
-            net-tools wireless-tools wpasupplicant \
-            vim nano
-      
-          if [[ "$SYSTEM_TYPE" == "kali-desktop" ]]; then
-            if [[ "$DESKTOP_ENV" == "xfce-full" ]]; then
-              sudo chroot rootfs apt-get install -y \
-                xfce4 xfce4-goodies lightdm slick-greeter \
-                xorg dbus-x11
-              sudo chroot rootfs systemctl enable lightdm
-            elif [[ "$DESKTOP_ENV" == "xfce-minimal" ]]; then
-              sudo chroot rootfs apt-get install -y \
-                xfce4 lightdm
-              sudo chroot rootfs systemctl enable lightdm
-            fi
-            sudo chroot rootfs apt-get install -y nmap netcat-traditional || true
-            
-          elif [[ "$SYSTEM_TYPE" == "kali-nethunter" ]]; then
-            sudo chroot rootfs apt-get install -y xfce4 lightdm
-            sudo chroot rootfs systemctl enable lightdm
-          fi
-          
-          # 修复：设置图形界面为默认启动（添加）
-          sudo chroot rootfs systemctl set-default graphical.target
-          
-          # 修复：配置自动登录（添加）
-          sudo mkdir -p rootfs/etc/lightdm
-          echo "[Seat:*]" | sudo tee rootfs/etc/lightdm/lightdm.conf
-          echo "autologin-user=kali" | sudo tee -a rootfs/etc/lightdm/lightdm.conf
-          echo "autologin-user-timeout=0" | sudo tee -a rootfs/etc/lightdm/lightdm.conf
-          echo "user-session=xfce" | sudo tee -a rootfs/etc/lightdm/lightdm.conf
-          
-          # 用户配置
-          echo "root:kali" | sudo chroot rootfs chpasswd
-          sudo chroot rootfs useradd -m -G sudo -s /bin/bash kali 2>/dev/null || true
-          echo "kali:kali" | sudo chroot rootfs chpasswd
-          
-          # SSH配置
-          echo "PermitRootLogin yes" | sudo tee -a rootfs/etc/ssh/sshd_config
-          echo "PasswordAuthentication yes" | sudo tee -a rootfs/etc/ssh/sshd_config
-      
-      - name: 安装内核
-        run: |
-          sudo cp debs/*.deb rootfs/tmp/ 2>/dev/null || {
-            echo "错误: 未找到内核deb包"
-            exit 1
-          }
-          
-          echo ">>> 安装内核"
-          sudo chroot rootfs apt-get update
-          sudo chroot rootfs apt-get clean
-          
-          sudo chroot rootfs bash -c "
-            cd /tmp
-            dpkg -i *.deb 2>/dev/null || true
-            apt-get install -f -y
-            dpkg --configure -a 2>/dev/null || true
-          "
-          
-          echo ">>> 确保/boot内容并创建正确的符号链接"
-          sudo chroot rootfs bash -c '
-            cd /boot
-            
-            echo "=== /boot 目录原始内容 ==="
-            ls -la
-            
-            # 查找内核版本（从modules目录）
-            KERNEL_VER=$(ls /lib/modules/ | head -1)
-            echo "检测到内核版本: $KERNEL_VER"
-            
-            # 查找实际的vmlinuz文件
-            VMLINUZ=$(ls vmlinuz* 2>/dev/null | head -1)
-            if [ -z "$VMLINUZ" ]; then
-              # 尝试其他可能的命名
-              VMLINUZ=$(ls /boot/vmlinuz* 2>/dev/null | head -1 | xargs basename)
-            fi
-            
-            # 查找initrd文件
-            INITRD=$(ls initrd.img* initramfs* 2>/dev/null | head -1)
-            
-            # 查找dtb文件 - 尝试多种可能的命名
-            DTB=$(ls dtb* 2>/dev/null | head -1)
-            if [ -z "$DTB" ]; then
-              # 尝试从kernel release查找dtb
-              if [ -n "$KERNEL_VER" ]; then
-                DTB=$(ls dtb-${KERNEL_VER}* 2>/dev/null | head -1)
-              fi
-            fi
-            
-            echo "找到的文件:"
-            echo "  vmlinuz: $VMLINUZ"
-            echo "  initrd: $INITRD"
-            echo "  dtb: $DTB"
-            
-            # 创建标准符号链接（GRUB将使用这些）
-            if [ -n "$VMLINUZ" ] && [ -f "$VMLINUZ" ]; then
-              ln -sf "$VMLINUZ" vmlinuz
-              echo "创建链接: vmlinuz -> $VMLINUZ"
-              
-              # 同时创建带-sm8150后缀的链接（备用）
-              ln -sf "$VMLINUZ" vmlinuz-sm8150
-            fi
-            
-            if [ -n "$INITRD" ] && [ -f "$INITRD" ]; then
-              ln -sf "$INITRD" initrd.img
-              echo "创建链接: initrd.img -> $INITRD"
-              
-              # 同时创建带-sm8150后缀的链接
-              ln -sf "$INITRD" initrd.img-sm8150
-            fi
-            
-            if [ -n "$DTB" ] && [ -f "$DTB" ]; then
-              ln -sf "$DTB" dtb
-              echo "创建链接: dtb -> $DTB"
-              
-              # 同时创建带-sm8150后缀的链接
-              ln -sf "$DTB" dtb-sm8150
-            else
-              echo "警告: 未找到dtb文件，尝试从firmware复制..."
-              # 有些内核dtb可能在/lib/firmware下
-              if [ -d "/lib/firmware/${KERNEL_VER}" ]; then
-                find /lib/firmware/${KERNEL_VER} -name "*.dtb" -exec cp {} /boot/dtb \; 2>/dev/null
-                if [ -f "dtb" ]; then
-                  echo "从firmware复制dtb成功"
-                fi
-              fi
-            fi
-            
-            echo "=== /boot 目录最终内容 ==="
-            ls -la
-          '
-          
-          echo ">>> 验证/boot内容"
-          ls -la rootfs/boot/
-      
-      - name: 生成GRUB配置
-        run: |
-          echo ">>> 生成动态GRUB配置"
-          
-          # 先创建grub目录
-          sudo mkdir -p rootfs/boot/grub
-          
-          # 获取实际的内核文件名用于生成grub.cfg
-          sudo chroot rootfs bash -c '
-            cd /boot
-            KERNEL_VER=$(ls /lib/modules/ | head -1)
-            echo "KERNEL_VERSION=$KERNEL_VER" > /tmp/kernel_info.txt
-            
-            # 获取实际文件名
-            VMLINUZ=$(readlink -f vmlinuz 2>/dev/null | xargs basename)
-            INITRD=$(readlink -f initrd.img 2>/dev/null | xargs basename)
-            DTB=$(readlink -f dtb 2>/dev/null | xargs basename)
-            
-            echo "VMLINUZ=$VMLINUZ" >> /tmp/kernel_info.txt
-            echo "INITRD=$INITRD" >> /tmp/kernel_info.txt
-            echo "DTB=$DTB" >> /tmp/kernel_info.txt
-          '
-          
-          # 读取内核信息
-          cat rootfs/tmp/kernel_info.txt
-          
-          # 创建grub配置文件
-          sudo tee rootfs/boot/grub/grub.cfg << 'GRUBEOF'
-          set timeout=30
-          set default=0
-          
-          # 启用 USB 键盘输入和输出
-          terminal_input console usb_keyboard
-          terminal_output console
-          
-          # 加载 USB/OTG 键盘支持
-          insmod usb
-          insmod usb_keyboard
-          insmod ehci
-          insmod ohci
-          insmod uhci
-          insmod xhci
-          
-          menuentry 'Kali Linux for Mi 9T Pro/Redmi K20 Pro' --class kali --class gnu-linux --class gnu --class os {
-          	insmod gzio
-          	if [ x$grub_platform = xxen ]; then insmod xzio; insmod lzopio; fi
-          	insmod part_gpt
-          	insmod ext2
-          	set root='hd0,gpt33'
-          	search --no-floppy --fs-uuid --set=root 01dad29f-cb79-441f-9a3b-aeb0d1037d7a
-          	linux	/boot/vmlinuz root=UUID=01dad29f-cb79-441f-9a3b-aeb0d1037d7a ro console=tty0 console=ttyMSM0,115200n8
-          	initrd	/boot/initrd.img
-          	devicetree	/boot/dtb
-          }
-          GRUBEOF
-          
-          echo ">>> GRUB配置已生成"
-          cat rootfs/boot/grub/grub.cfg
-      
-      - name: 配置引导
-        run: |
-          sudo chroot rootfs apt-get install -y grub-efi-arm64 2>/dev/null || true
-          
-          echo "PARTLABEL=linux / ext4 errors=remount-ro 0 1" | sudo tee rootfs/etc/fstab
-          echo "PARTLABEL=esp /boot/efi vfat umask=0077 0 1" | sudo tee -a rootfs/etc/fstab
-          
-          sudo mkdir -p rootfs/boot/efi
-          sudo mkdir -p rootfs/boot/grub
-      
-      - name: 清理和压缩
-        run: |
-          sudo chroot rootfs apt-get clean 2>/dev/null || true
-          sudo rm -rf rootfs/var/lib/apt/lists/* rootfs/tmp/* 2>/dev/null || true
-          
-          sudo umount rootfs/dev 2>/dev/null || true
-          sudo umount rootfs/proc 2>/dev/null || true
-          sudo umount rootfs/sys 2>/dev/null || true
-          sudo umount rootfs 2>/dev/null || true
-          
-          ROOTFS_IMG="rootfs-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}.img"
-          xz -T0 -v "$ROOTFS_IMG"
-      
-      - name: 发布
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: kali-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}
-          name: "Kali ${{ github.event.inputs.system_type }} ${{ github.event.inputs.kernel_version }}"
-          files: rootfs-*.img.xz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          **Flash:**
+          ```bash
+          fastboot flash boot kali-raphael-live.img
+          ```
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
