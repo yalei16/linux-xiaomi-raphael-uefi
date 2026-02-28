@@ -188,15 +188,21 @@ jobs:
         sudo umount -l ./rootfs/proc 2>/dev/null || true
         sudo umount -l ./rootfs/sys 2>/dev/null || true
 
-    - name: Create initramfs
+        - name: Create initramfs
       run: |
+        # 进入 rootfs 目录
         cd "${{ env.BUILD_DIR }}/rootfs"
-        # 第一步：创建未压缩的 cpio
+        
+        # 第一步：创建未压缩的 cpio 归档（无续行符）
         sudo find . -print0 | sudo cpio --null --create --format=newc > "${{ env.BUILD_DIR }}/initramfs.cpio"
-        # 第二步：压缩（单独执行，不用管道）
+        
+        # 第二步：压缩（独立命令）
         gzip -9 "${{ env.BUILD_DIR }}/initramfs.cpio"
-        # 第三步：改名
+        
+        # 第三步：重命名（因为 gzip 会添加 .gz 后缀）
         mv "${{ env.BUILD_DIR }}/initramfs.cpio.gz" "${{ env.BUILD_DIR }}/initramfs.gz"
+        
+        # 验证
         ls -lh "${{ env.BUILD_DIR }}/initramfs.gz"
 
         - name: Build boot.img
