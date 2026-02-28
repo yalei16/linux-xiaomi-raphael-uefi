@@ -190,13 +190,14 @@ jobs:
 
     - name: Create initramfs
       run: |
-        cd ${{ env.BUILD_DIR }}/rootfs
-        
-        # 打包为cpio.gz
-        sudo find . -print0 | sudo cpio --null --create --verbose --format=newc | \
-          gzip -9 > ${{ env.BUILD_DIR }}/initramfs.gz
-        
-        ls -lh ${{ env.BUILD_DIR }}/initramfs.gz
+        cd "${{ env.BUILD_DIR }}/rootfs"
+        # 第一步：创建未压缩的 cpio
+        sudo find . -print0 | sudo cpio --null --create --format=newc > "${{ env.BUILD_DIR }}/initramfs.cpio"
+        # 第二步：压缩（单独执行，不用管道）
+        gzip -9 "${{ env.BUILD_DIR }}/initramfs.cpio"
+        # 第三步：改名
+        mv "${{ env.BUILD_DIR }}/initramfs.cpio.gz" "${{ env.BUILD_DIR }}/initramfs.gz"
+        ls -lh "${{ env.BUILD_DIR }}/initramfs.gz"
 
         - name: Build boot.img
           run: |
