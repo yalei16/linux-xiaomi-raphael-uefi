@@ -1,113 +1,432 @@
-name: Build Kali Live Boot for Raphael
+name: 构建 Kali for K20 Pro (含 initramfs)
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
-
-env:
-  DEB_URL_BASE: "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v6.18"
-  BUILD_DIR: ${{ github.workspace }}/build
-  OUTPUT_DIR: ${{ github.workspace }}/output
+    inputs:
+      system_type:
+        description: '系统类型'
+        required: true
+        default: 'kali-desktop'
+        type: choice
+        options:
+          - kali-desktop
+          - kali-server
+          - kali-nethunter
+      
+      kernel_version:
+        description: '内核版本号（如 6.12）'
+        required: true
+        type: string
+      
+      desktop_env:
+        description: '桌面环境（仅桌面版有效）'
+        required: false
+        default: 'xfce-full'
+        type: choice
+        options:
+          - xfce-full
+          - xfce-minimal
+          - none
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            debootstrap parted e2fsprogs xz-utils \
+            qemu-user-static binfmt-support \
+            initramfs-tools-core
+      
+      - name: 下载内核包
+        run: |
+          mkdir -p debs
+          cd debs
+          
+          echo "下载内核包..."
+          
+          # 使用你的内核发布地址
+          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v${{ github.event.inputs.kernel_version }}/linux-image-xiaomi-raphael.deb"
+          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v${{ github.event.inputs.kernel_version }}/linux-headers-xiaomi-raphael.deb"
+          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v${{ github.event.inputs.kernel_version }}/firmware-xiaomi-raphael.deb"
+          wget -q --show-progress "https://github.com/yalei16/linux-xiaomi-raphael-uefi/releases/download/kernel-v${{ github.event.inputs.kernel_version }}/alsa-xiaomi-raphael.deb"
+          
+          echo "下载完成:"
+          ls -la *.deb
+          
+          if [[ ! -f "linux-image-xiaomi-raphael.deb" ]]; then
+            echo "错误: 内核包下载失败"
+            exit 1
+          fi
 
-    - name: Install build dependencies
-      run: sudo apt-get update && sudo apt-get install -y qemu-user-static binfmt-support debootstrap abootimg device-tree-compiler gcc-aarch64-linux-gnu cpio gzip wget file
+      - name: 创建镜像并构建基础系统
+        run: |
+          SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
+          KERNEL_VER="${{ github.event.inputs.kernel_version }}"
+          ROOTFS_IMG="kali-raphael-${SYSTEM_TYPE}-${KERNEL_VER}.img"
+          
+          echo "构建: $SYSTEM_TYPE"
+          echo "内核: $KERNEL_VER"
+          echo "输出: $ROOTFS_IMG"
+          
+          # 创建 12GB 镜像（给 Kali 工具留足空间）
+          truncate -s 12G "$ROOTFS_IMG"
+          mkfs.ext4 -F -L "KALI_ROOT" "$ROOTFS_IMG"
+          
+          mkdir -p rootfs
+          sudo mount -o loop "$ROOTFS_IMG" rootfs
+      
+      - name: 安装 Kali 基础系统
+        run: |
+          echo ">>> 使用清华源构建 Kali ARM64"
+          sudo debootstrap --foreign --arch=arm64 kali-rolling rootfs http://mirrors.tuna.tsinghua.edu.cn/kali
+          
+          sudo chroot rootfs /debootstrap/debootstrap --second-stage
+          
+          # 配置基础源
+          echo "deb http://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free non-free-firmware" | sudo tee rootfs/etc/apt/sources.list
+          echo "deb-src http://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free non-free-firmware" | sudo tee -a rootfs/etc/apt/sources.list
+      
+      - name: 配置 K20 Pro 硬件支持 (关键步骤)
+        run: |
+          # 挂载虚拟文件系统
+          sudo mount --bind /dev rootfs/dev
+          sudo mount --bind /proc rootfs/proc
+          sudo mount --bind /sys rootfs/sys
+          sudo mount --bind /dev/pts rootfs/dev/pts
+          
+          # 配置主机名和 hosts
+          echo "kali-raphael" | sudo tee rootfs/etc/hostname
+          cat << 'EOF' | sudo tee rootfs/etc/hosts
+          127.0.0.1 localhost
+          127.0.1.1 kali-raphael
+          ::1 localhost ip6-localhost ip6-loopback
+          ff02::1 ip6-allnodes
+          ff02::2 ip6-allrouters
+          EOF
+          
+          sudo chroot rootfs apt-get update
+          sudo chroot rootfs apt-get upgrade -y
 
-    - name: Download kernel packages
-      run: |
-        mkdir -p ${{ env.BUILD_DIR }}/debs
-        cd ${{ env.BUILD_DIR }}/debs
-        wget -q "${{ env.DEB_URL_BASE }}/linux-image-xiaomi-raphael.deb"
-        wget -q "${{ env.DEB_URL_BASE }}/linux-headers-xiaomi-raphael.deb"
-        wget -q "${{ env.DEB_URL_BASE }}/firmware-xiaomi-raphael.deb"
-        wget -q "${{ env.DEB_URL_BASE }}/alsa-xiaomi-raphael.deb"
-        ls -lh *.deb
+      - name: 安装 K20 Pro 必需驱动和工具
+        run: |
+          # 安装基础工具
+          sudo chroot rootfs apt-get install -y \
+            sudo ssh openssh-server \
+            initramfs-tools initramfs-tools-core \
+            curl wget net-tools wireless-tools wpasupplicant \
+            vim nano htop \
+            dbus dbus-x11 \
+            policykit-1
 
-    - name: Extract kernel
-      run: |
-        mkdir -p ${{ env.BUILD_DIR }}/extract
-        for deb in ${{ env.BUILD_DIR }}/debs/*.deb; do dpkg-deb -x "$deb" ${{ env.BUILD_DIR }}/extract/; done
-        KERNEL=$(find ${{ env.BUILD_DIR }}/extract -name "vmlinuz*" -type f | head -1)
-        echo "KERNEL_PATH=$KERNEL" >> $GITHUB_ENV
-        echo "Found kernel: $KERNEL"
+          # 安装 K20 Pro 特定固件（如果内核包中没有）
+          sudo chroot rootfs apt-get install -y \
+            firmware-ath10k firmware-qcom-soc \
+            2>/dev/null || echo "固件包稍后从内核deb安装"
 
-    - name: Build rootfs
-      run: |
-        sudo mkdir -p ${{ env.BUILD_DIR }}/rootfs
-        sudo debootstrap --foreign --variant=minbase --arch=arm64 kali-rolling ${{ env.BUILD_DIR }}/rootfs http://http.kali.org/kali
-        sudo cp /usr/bin/qemu-aarch64-static ${{ env.BUILD_DIR }}/rootfs/usr/bin/
+      - name: 配置 initramfs (K20 Pro 专用)
+        run: |
+          echo ">>> 配置 K20 Pro 专用 initramfs"
+          
+          # 1. 创建 initramfs 模块配置文件（强制包含这些驱动）
+          cat << 'EOF' | sudo tee rootfs/etc/initramfs-tools/modules
+          # K20 Pro (raphael) 必需驱动模块
+          ufs_qcom
+          ufshcd
+          ufshcd_pltfrm
+          scsi_mod
+          sd_mod
+          xhci_hcd
+          xhci_pci
+          dwc3
+          dwc3_qcom
+          usbcore
+          usbcommon
+          usbhid
+          hid_generic
+          hid_multitouch
+          usbkbd
+          usbmouse
+          psmouse
+          msm_drm
+          mdss_mdp
+          drm_kms_helper
+          panel_simple
+          qrtr
+          ns
+          pm8998_charger
+          pm8998_thermal
+          arm_smmu
+          arm_smmu_qcom
+          iommu_dma
+          clk_qcom
+          gcc_sm8150
+          rpmh_cc
+          sm8150_cc
+          phy_qcom_qmp_pcie
+          phy_qcom_qmp_usb
+          pcie_qcom
+          EOF
 
-    - name: Configure rootfs
-      run: |
-        sudo mount --bind /dev ${{ env.BUILD_DIR }}/rootfs/dev
-        sudo mount --bind /proc ${{ env.BUILD_DIR }}/rootfs/proc
-        sudo mount --bind /sys ${{ env.BUILD_DIR }}/rootfs/sys
-        sudo chroot ${{ env.BUILD_DIR }}/rootfs /debootstrap/debootstrap --second-stage
-        sudo tee ${{ env.BUILD_DIR }}/rootfs/tmp/setup.sh > /dev/null << 'EOFSCRIPT'
-        #!/bin/bash
-        set -e
-        echo "root:toor" | chpasswd
-        apt-get update
-        apt-get install -y --no-install-recommends busybox-static dropbear-bin wireless-tools wpasupplicant iproute2 iputils-ping net-tools kmod udev
-        mkdir -p /etc/dropbear
-        dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key
-        dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key
-        cat > /init << 'EOFINIT'
-        #!/bin/sh
-        echo "[*] Kali Live Boot for Redmi K20 Pro"
-        mount -t proc proc /proc
-        mount -t sysfs sys /sys
-        mount -t devtmpfs dev /dev
-        mount -t tmpfs tmp /tmp
-        echo /sbin/mdev > /proc/sys/kernel/hotplug
-        mdev -s
-        ifconfig lo 127.0.0.1 up
-        /usr/sbin/dropbear -p 22
-        mkdir -p /data
-        mount /dev/block/bootdevice/by-name/userdata /data 2>/dev/null || echo "[!] RAM mode"
-        echo "[+] Ready. Login: root/toor"
-        exec /bin/sh
-        EOFINIT
-        chmod +x /init
-        /bin/busybox --install -s /bin/
-        rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* /tmp/* /var/tmp/*
-        apt-get clean
-        EOFSCRIPT
-        sudo chmod +x ${{ env.BUILD_DIR }}/rootfs/tmp/setup.sh
-        sudo chroot ${{ env.BUILD_DIR }}/rootfs /tmp/setup.sh
-        if [ -d "${{ env.BUILD_DIR }}/extract/lib/firmware" ]; then sudo cp -r ${{ env.BUILD_DIR }}/extract/lib/firmware/* ${{ env.BUILD_DIR }}/rootfs/lib/firmware/ 2>/dev/null || true; fi
-        sudo umount -l ${{ env.BUILD_DIR }}/rootfs/dev || true
-        sudo umount -l ${{ env.BUILD_DIR }}/rootfs/proc || true
-        sudo umount -l ${{ env.BUILD_DIR }}/rootfs/sys || true
+          # 2. 创建 initramfs hook 脚本（在启动早期加载 USB 键盘支持）
+          sudo mkdir -p rootfs/etc/initramfs-tools/scripts/init-premount
+          cat << 'EOF' | sudo tee rootfs/etc/initramfs-tools/scripts/init-premount/k20pro-usb
+          #!/bin/sh
+          # K20 Pro USB 键盘支持初始化
+          
+          PREREQ=""
+          prereqs() {
+              echo "$PREREQ"
+          }
+          
+          case $1 in
+              prereqs)
+                  prereqs
+                  exit 0
+                  ;;
+          esac
+          
+          . /scripts/functions
+          
+          # 等待 USB 控制器初始化
+          log_begin_msg "等待 K20 Pro USB 控制器..."
+          sleep 2
+          
+          # 强制加载 USB HID 驱动（解决 OTG 键盘检测问题）
+          modprobe usbhid || true
+          modprobe hid_generic || true
+          modprobe xhci_hcd || true
+          modprobe xhci_pci || true
+          
+          # 创建必要的设备节点（防止某些键盘无法识别）
+          mkdir -p /dev/input
+          mknod /dev/input/event0 c 13 64 2>/dev/null || true
+          mknod /dev/input/event1 c 13 65 2>/dev/null || true
+          
+          log_end_msg
+          EOF
+          
+          sudo chmod +x rootfs/etc/initramfs-tools/scripts/init-premount/k20pro-usb
 
-    - name: Create initramfs
-      run: |
-        cd ${{ env.BUILD_DIR }}/rootfs
-        sudo sh -c 'find . -print0 | cpio --null --create --format=newc > "${{ env.BUILD_DIR }}/initramfs.cpio"'
-        gzip -9 ${{ env.BUILD_DIR }}/initramfs.cpio
-        mv ${{ env.BUILD_DIR }}/initramfs.cpio.gz ${{ env.BUILD_DIR }}/initramfs.gz
-        ls -lh ${{ env.BUILD_DIR }}/initramfs.gz
+          # 3. 配置 initramfs 启动参数（等待 rootfs 设备）
+          cat << 'EOF' | sudo tee rootfs/etc/initramfs-tools/initramfs.conf
+          MODULES=most
+          BUSYBOX=auto
+          KEYMAP=n
+          COMPRESS=gzip
+          DEVICE=eth0
+          NFSROOT=auto
+          RUNSIZE=10%
+          EOF
 
-    - name: Build boot.img
-      run: |
-        mkdir -p ${{ env.OUTPUT_DIR }}
-        KERNEL="${{ env.KERNEL_PATH }}"
-        INITRAMFS="${{ env.BUILD_DIR }}/initramfs.gz"
-        OUTPUT="${{ env.OUTPUT_DIR }}/kali-raphael-live.img"
-        CMDLINE="console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.console=ttyMSM0 androidboot.memcg=1 lpm_levels.sleep_disabled=1 androidboot.usbcontroller=a600000.dwc3 buildvariant=userdebug init=/init rw"
-        abootimg --create "$OUTPUT" -k "$KERNEL" -r "$INITRAMFS" -c "pagesize = 4096" -c "kerneladdr = 0x00008000" -c "ramdiskaddr = 0x01000000" -c "secondaddr = 0x00f00000" -c "tagsaddr = 0x00000100" -c "cmdline = ${CMDLINE}"
-        ls -lh "$OUTPUT"
+          # 4. 创建 fstab（使用 PARTLABEL，防止分区号变化）
+          cat << 'EOF' | sudo tee rootfs/etc/fstab
+          PARTLABEL=KALI_ROOT / ext4 errors=remount-ro,noatime 0 1
+          PARTLABEL=esp /boot/efi vfat umask=0077 0 1
+          /dev/sda33 / ext4 errors=remount-ro,noatime 0 1
+          EOF
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: kali-raphael-boot
-        path: ${{ env.OUTPUT_DIR }}/kali-raphael-live.img
+      - name: 安装桌面环境（可选）
+        run: |
+          SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
+          DESKTOP_ENV="${{ github.event.inputs.desktop_env }}"
+          
+          if [[ "$SYSTEM_TYPE" == "kali-desktop" || "$SYSTEM_TYPE" == "kali-nethunter" ]]; then
+            if [[ "$DESKTOP_ENV" == "xfce-full" ]]; then
+              echo ">>> 安装完整 XFCE"
+              sudo chroot rootfs apt-get install -y \
+                xfce4 xfce4-goodies \
+                lightdm slick-greeter \
+                xorg xserver-xorg-input-all \
+                xvkbd  # 虚拟键盘，无 OTG 键盘时使用
+              
+              # 配置 lightdm 自动登录
+              sudo mkdir -p rootfs/etc/lightdm/lightdm.conf.d
+              cat << 'EOF' | sudo tee rootfs/etc/lightdm/lightdm.conf.d/99-autologin.conf
+              [Seat:*]
+              autologin-user=kali
+              autologin-user-timeout=0
+              user-session=xfce
+              EOF
+              
+            elif [[ "$DESKTOP_ENV" == "xfce-minimal" ]]; then
+              echo ">>> 安装最小 XFCE"
+              sudo chroot rootfs apt-get install -y \
+                xfce4 lightdm xorg xvkbd
+              
+              cat << 'EOF' | sudo tee rootfs/etc/lightdm/lightdm.conf.d/99-autologin.conf
+              [Seat:*]
+              autologin-user=kali
+              autologin-user-timeout=0
+              user-session=xfce
+              EOF
+            fi
+            
+            sudo chroot rootfs systemctl enable lightdm
+            sudo chroot rootfs systemctl set-default graphical.target
+          fi
+
+      - name: 安装内核并生成 initramfs
+        run: |
+          echo ">>> 安装内核包"
+          sudo cp debs/*.deb rootfs/tmp/
+          
+          # 安装内核（允许依赖错误，后续修复）
+          sudo chroot rootfs bash -c "
+            cd /tmp
+            dpkg -i *.deb || true
+            apt-get install -f -y
+            dpkg --configure -a || true
+          "
+          
+          # 获取安装后的内核版本
+          KERNEL_VER=$(ls rootfs/lib/modules/ | head -1)
+          echo "检测到内核版本: $KERNEL_VER"
+          
+          if [ -z "$KERNEL_VER" ]; then
+            echo "错误: 内核模块未安装"
+            exit 1
+          fi
+          
+          # 关键：重新生成 initramfs（包含 K20 Pro 配置）
+          echo ">>> 生成 K20 Pro 专用 initramfs"
+          sudo chroot rootfs update-initramfs -c -k "$KERNEL_VER"
+          
+          # 验证 initramfs 是否包含必要驱动
+          echo ">>> 验证 initramfs 内容"
+          sudo chroot rootfs lsinitramfs "/boot/initrd.img-${KERNEL_VER}" | grep -E "(ufs|xhci|usbhid)" || {
+            echo "警告: initramfs 可能缺少必要驱动"
+          }
+          
+          # 创建软链接（方便 GRUB 配置）
+          sudo chroot rootfs bash -c "
+            cd /boot
+            ln -sf vmlinuz-${KERNEL_VER} vmlinuz-raphael
+            ln -sf initrd.img-${KERNEL_VER} initramfs-raphael.img
+            ln -sf System.map-${KERNEL_VER} System.map-raphael
+            ls -la
+          "
+          
+          # 复制 dtb 到 /boot（如果内核包中有）
+          if [ -d "rootfs/usr/lib/linux-image-${KERNEL_VER}/qcom" ]; then
+            echo ">>> 复制 DTB 文件"
+            sudo cp rootfs/usr/lib/linux-image-${KERNEL_VER}/qcom/sm8150-raphael*.dtb rootfs/boot/raphael.dtb 2>/dev/null || \
+            sudo find rootfs/usr/lib/linux-image-${KERNEL_VER} -name "*raphael*.dtb" -exec cp {} rootfs/boot/raphael.dtb \; 2>/dev/null || \
+            echo "DTB 将在后续手动处理"
+          fi
+
+      - name: 配置用户和启动脚本
+        run: |
+          # 创建用户
+          sudo chroot rootfs useradd -m -G sudo,adm,dialout,netdev -s /bin/bash kali 2>/dev/null || true
+          echo "root:kali" | sudo chroot rootfs chpasswd
+          echo "kali:kali" | sudo chroot rootfs chpasswd
+          
+          # 配置 sudo 免密（可选，方便调试）
+          echo "kali ALL=(ALL) NOPASSWD: ALL" | sudo tee rootfs/etc/sudoers.d/kali
+          sudo chmod 440 rootfs/etc/sudoers.d/kali
+          
+          # 配置 SSH
+          sudo chroot rootfs systemctl enable ssh
+          cat << 'EOF' | sudo tee -a rootfs/etc/ssh/sshd_config
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          EOF
+          
+          # 创建自动启动脚本（针对无键盘场景）
+          if [[ "${{ github.event.inputs.desktop_env }}" != "none" ]]; then
+            # 确保 XFCE 自动启动虚拟键盘（如果检测到无物理键盘）
+            sudo mkdir -p rootfs/home/kali/.config/autostart
+            cat << 'EOF' | sudo tee rootfs/home/kali/.config/autostart/onboard.desktop
+            [Desktop Entry]
+            Type=Application
+            Name=Onboard
+            Exec=onboard
+            Hidden=false
+            NoDisplay=false
+            X-GNOME-Autostart-enabled=true
+            EOF
+            
+            # 如果没有 onboard，使用 xvkbd
+            cat << 'EOF' | sudo tee rootfs/home/kali/.config/autostart/xvkbd.desktop
+            [Desktop Entry]
+            Type=Application
+            Name=xvkbd
+            Exec=xvkbd
+            Hidden=false
+            NoDisplay=false
+            X-GNOME-Autostart-enabled=true
+            EOF
+            
+            sudo chroot rootfs chown -R kali:kali /home/kali/.config
+          fi
+
+      - name: 清理和打包
+        run: |
+          SYSTEM_TYPE="${{ github.event.inputs.system_type }}"
+          KERNEL_VER="${{ github.event.inputs.kernel_version }}"
+          ROOTFS_IMG="kali-raphael-${SYSTEM_TYPE}-${KERNEL_VER}.img"
+          
+          # 清理
+          sudo chroot rootfs apt-get clean
+          sudo rm -rf rootfs/var/lib/apt/lists/* rootfs/tmp/* rootfs/root/.bash_history
+          
+          # 卸载
+          sudo umount rootfs/dev/pts 2>/dev/null || true
+          sudo umount rootfs/dev 2>/dev/null || true
+          sudo umount rootfs/proc 2>/dev/null || true
+          sudo umount rootfs/sys 2>/dev/null || true
+          sudo umount rootfs 2>/dev/null || true
+          
+          # 压缩
+          echo ">>> 压缩镜像..."
+          xz -T0 -v -z "$ROOTFS_IMG"
+          
+          ls -lh "${ROOTFS_IMG}.xz"
+
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: kali-raphael-${{ github.event.inputs.system_type }}-${{ github.event.inputs.kernel_version }}
+          name: "Kali for K20 Pro ${{ github.event.inputs.system_type }} ${{ github.event.inputs.kernel_version }}"
+          body: |
+            ## Kali Linux for Redmi K20 Pro (Raphael)
+            
+            ### 包含内容
+            - 内核版本: ${{ github.event.inputs.kernel_version }}
+            - 系统类型: ${{ github.event.inputs.system_type }}
+            - 桌面环境: ${{ github.event.inputs.desktop_env }}
+            
+            ### K20 Pro 专用配置
+            - **initramfs**: 包含 ufs_qcom, xhci_hcd, usbhid 等必需驱动
+            - **USB 键盘支持**: 启动时自动加载 OTG 键盘驱动
+            - **自动登录**: 用户 `kali` / 密码 `kali`，自动进入桌面
+            - **虚拟键盘**: 预装 xvkbd，无物理键盘时可操作
+            
+            ### 刷机方法
+            1. 刷入 UEFI 到 abl 分区
+            2. 本 rootfs 刷入 sda33
+            3. 将 `/boot` 中的 `vmlinuz-raphael`, `initramfs-raphael.img`, `raphael.dtb` 复制到 ESP 分区 (sda32)
+            4. GRUB 配置示例:
+            ```bash
+            menuentry "Kali Linux" {
+                linux /vmlinuz-raphael root=/dev/sda33 rootwait rw console=ttyMSM0,115200n8
+                initrd /initramfs-raphael.img
+                devicetree /raphael.dtb
+            }
+            ```
+            
+            ### 默认账号
+            - 用户名: `kali`
+            - 密码: `kali`
+            - Root: `kali`
+          files: |
+            kali-raphael-*.img.xz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
